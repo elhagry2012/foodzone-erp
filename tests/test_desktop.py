@@ -127,3 +127,30 @@ def test_voucher_attachments_window_and_security_form(app, tmp_path, monkeypatch
         if hasattr(erp, name):
             assert getattr(erp, name).get() == ""        # كلمات المرور لا تُعرض أبداً
     assert not errors, errors
+
+
+def test_forgot_password_dialog_and_admin_requests_panel(app):
+    erp, errors, w = app
+    F = w["F"]
+    from elhagry_desktop import app as A
+    F.save_user_account(None, "clerk.x", "موظف", "Clerk-1234", "Clerk-1234", False, True, ["dashboard"])
+    login = A.LoginWindow.__new__(A.LoginWindow)        # نموذج الدخول بدون فتح نافذة رئيسية جديدة
+    login.win = tk.Toplevel(erp.root)
+    login.user_e = tk.Entry(login.win)
+    login.user_e.insert(0, "clerk.x")
+    dlg = login.forgot_password()
+    dlg.update_idletasks()
+    dlg.destroy()
+    login.win.destroy()
+    F.request_password_reset("clerk.x", "من الاختبار")
+    erp.show_page("users")
+    erp.root.update_idletasks()
+    erp.load_pw_requests()
+    rows = erp.pwreq_tree.get_children()
+    assert len(rows) == 1
+    erp.pwreq_tree.selection_set(rows[0])
+    erp.pwreq_pw1.insert(0, "Brand-New-1")
+    erp.pwreq_pw2.insert(0, "Brand-New-1")
+    erp.resolve_pw_request(True)
+    assert F.authenticate("clerk.x", "Brand-New-1")
+    assert not errors, errors

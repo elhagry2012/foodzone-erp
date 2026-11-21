@@ -1281,14 +1281,56 @@ class LoginWindow:
         forgot = tk.Label(form, text="نسيت كلمة المرور؟", font=("Segoe UI", 9, "underline"), bg=LOGIN_FORM_BG,
                           fg="#0d9488", cursor="hand2")
         forgot.pack()
-        forgot.bind("<Button-1>", lambda e: messagebox.showinfo(
-            "استعادة كلمة المرور", "لأمان النظام لا تُستعاد كلمة المرور تلقائياً.\n"
-                                    "تواصل مع مدير النظام لإعادة تعيينها من شاشة «إدارة المستخدمين».", parent=w))
+        forgot.bind("<Button-1>", lambda e: self.forgot_password())
         tk.Frame(form, bg=LOGIN_FORM_BG, width=400, height=1).pack()  # يثبّت عرض النموذج
 
         w.bind("<Return>", self.submit)
         w.bind("<KP_Enter>", self.submit)
         w.after(50, lambda: (w.lift(), w.focus_force(), self.user_e.focus_set()))
+
+    def forgot_password(self):
+        """نموذج «نسيت كلمة المرور؟»: يرسل طلباً معلقاً للمدير (لا يكشف بيانات ولا يغيّر كلمة المرور)."""
+        dlg = tk.Toplevel(self.win)
+        dlg.title("نسيت كلمة المرور؟")
+        dlg.configure(bg=LOGIN_FORM_BG)
+        dlg.transient(self.win)
+        dlg.resizable(False, False)
+        body = tk.Frame(dlg, bg=LOGIN_FORM_BG, padx=22, pady=18)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="طلب إعادة تعيين كلمة المرور", font=("Segoe UI", 13, "bold"), bg=LOGIN_FORM_BG,
+                 fg=LOGIN_PANEL_BG, anchor="e").pack(fill="x")
+        tk.Label(body, text="يُرسل الطلب لمدير النظام للمراجعة. كلمة المرور الحالية لا تتغير إلا بعد موافقته.",
+                 font=("Segoe UI", 9), bg=LOGIN_FORM_BG, fg="#6b7280", wraplength=360, justify="right",
+                 anchor="e").pack(fill="x", pady=(4, 12))
+        user_e = self._field(body, "اسم المستخدم")
+        user_e.insert(0, self.user_e.get().strip())
+        tk.Label(body, text="ملاحظة للمدير (اختياري)", bg=LOGIN_FORM_BG, fg="#111827", font=("Segoe UI", 10, "bold"),
+                 anchor="e").pack(fill="x")
+        note = tk.Text(body, height=3, width=40, font=("Segoe UI", 10), relief="flat", highlightthickness=1,
+                       highlightbackground="#d1d5db", wrap="word")
+        note.pack(fill="x", pady=(5, 12))
+        msg = tk.Label(body, text="", bg=LOGIN_FORM_BG, fg="#dc2626", font=("Segoe UI", 9, "bold"), wraplength=360,
+                       justify="right")
+        msg.pack(fill="x")
+
+        def send():
+            try:
+                text = _engine.request_password_reset(user_e.get(), note.get("1.0", "end"), source="desktop")
+            except UserError as e:
+                msg.config(text=str(e))
+                return
+            dlg.destroy()
+            messagebox.showinfo("تم إرسال الطلب", text, parent=self.win)
+
+        bar = tk.Frame(body, bg=LOGIN_FORM_BG)
+        bar.pack(fill="x", pady=(6, 0))
+        tk.Button(bar, text="إرسال الطلب", font=("Segoe UI", 10, "bold"), bg="#0d9488", fg="white", bd=0, padx=14,
+                  pady=6, cursor="hand2", command=send).pack(side="right")
+        tk.Button(bar, text="إلغاء", font=("Segoe UI", 10), bd=0, padx=14, pady=6, cursor="hand2",
+                  command=dlg.destroy).pack(side="right", padx=6)
+        dlg.bind("<Return>", lambda e: send() if e.widget is not note else None)
+        dlg.after(50, user_e.focus_set)
+        return dlg
 
     def _field(self, parent, label, show=""):
         tk.Label(parent, text=label, bg=LOGIN_FORM_BG, fg="#111827", font=("Segoe UI", 10, "bold"),
@@ -1753,8 +1795,77 @@ class ElhagryERP(Phase2Mixin):
             ("user", "اسم المستخدم", 120, "center"), ("name", "الاسم الكامل", 180, "e"), ("role", "الدور", 130, "center"),
             ("status", "الحالة", 90, "center"), ("last", "آخر دخول", 140, "center"), ("perms", "الصلاحيات", 400, "e")])
         self.users_tree.bind("<<TreeviewSelect>>", self.on_user_selected)
+        self._build_pw_requests(frame, before=box)
         self.users_load_roles(None)
         self.load_users()
+
+    # ---------------- طلبات «نسيت كلمة المرور»
+    def _build_pw_requests(self, frame, before=None):
+        box = ttk.LabelFrame(frame, text=" 🔑 طلبات إعادة تعيين كلمة المرور (من «نسيت كلمة المرور؟» بشاشة الدخول) ",
+                             padding=8)
+        box.pack(fill="x", padx=10, pady=(0, 6), **({"before": before} if before else {}))
+        top = tk.Frame(box)
+        top.pack(fill="x")
+        self.pwreq_lbl = tk.Label(top, text="", font=(UI_FONT, 10, "bold"), fg=UI["primary_dk"], anchor="e")
+        self.pwreq_lbl.pack(side="right")
+        self.pwreq_pending_var = tk.IntVar(value=1)
+        ttk.Checkbutton(top, text="المعلقة فقط", variable=self.pwreq_pending_var,
+                        command=self.load_pw_requests).pack(side="left")
+        self.pwreq_tree = make_tree(box, [
+            ("id", "رقم", 50, "center"), ("user", "المستخدم", 110, "center"), ("name", "الاسم", 140, "e"),
+            ("at", "وقت الطلب", 140, "center"), ("note", "ملاحظة المستخدم", 260, "e"), ("status", "الحالة", 70, "center"),
+            ("by", "عالجه", 90, "center"), ("done", "وقت المعالجة", 140, "center"), ("anote", "ملاحظة المدير", 180, "e")],
+            height=4)
+        self.pwreq_tree.tag_configure("pending", foreground="#b45309")
+        act = tk.Frame(box)
+        act.pack(fill="x", pady=(6, 0))
+        self.pwreq_pw1 = ttk.Entry(act, width=18, show="*")
+        self.pwreq_pw2 = ttk.Entry(act, width=18, show="*")
+        self.pwreq_note = ttk.Entry(act, width=30)
+        for lbl, w in (("كلمة المرور الجديدة:", self.pwreq_pw1), ("تأكيدها:", self.pwreq_pw2),
+                       ("ملاحظة المدير:", self.pwreq_note)):
+            ttk.Label(act, text=lbl).pack(side="right", padx=(8, 2))
+            w.pack(side="right")
+        money_button(act, "✅ تعيين كلمة المرور وإكمال الطلب", "#16a34a", lambda: self.resolve_pw_request(True), 9
+                     ).pack(side="left", padx=3)
+        money_button(act, "⛔ رفض الطلب", "#dc2626", lambda: self.resolve_pw_request(False), 9).pack(side="left", padx=3)
+        self.load_pw_requests()
+
+    def load_pw_requests(self):
+        if getattr(self, "pwreq_tree", None) is None:
+            return
+        clear_tree(self.pwreq_tree)
+        rows = _engine.list_password_requests(_engine.PW_REQ_PENDING if self.pwreq_pending_var.get() else None)
+        for rid, un, full, note, status, at, _src, done, by, anote in rows:
+            self.pwreq_tree.insert("", "end", iid=str(rid), values=(rid, un, full or "-", at, note or "-", status,
+                                                                     by or "-", done or "-", anote or "-"),
+                                   tags=("pending",) if status == _engine.PW_REQ_PENDING else ())
+        n = _engine.pending_password_request_count()
+        self.pwreq_lbl.config(text=f"⏳ {n} طلب معلق بانتظار المراجعة" if n else "✓ لا توجد طلبات معلقة",
+                              fg="#b45309" if n else "#15803d")
+
+    def resolve_pw_request(self, approve):
+        sel = self.pwreq_tree.selection()
+        if not sel:
+            messagebox.showinfo("تنبيه", "اختر طلباً من القائمة.")
+            return
+        rid = int(sel[0])
+        user = self.pwreq_tree.item(sel[0])["values"][1]
+        q = (f"تعيين كلمة المرور الجديدة للمستخدم «{user}» وإكمال الطلب رقم {rid}؟" if approve
+             else f"رفض طلب المستخدم «{user}» رقم {rid} دون تغيير كلمة مروره؟")
+        if not messagebox.askyesno("تأكيد", q):
+            return
+        try:
+            msg = _engine.resolve_password_request(rid, approve, self.pwreq_pw1.get(), self.pwreq_pw2.get(),
+                                           self.pwreq_note.get())
+        except Exception as e:
+            handle_error(e)
+            return
+        for e_ in (self.pwreq_pw1, self.pwreq_pw2, self.pwreq_note):
+            e_.delete(0, tk.END)
+        self.load_pw_requests()
+        self.load_users()
+        messagebox.showinfo("تم", msg + ("\nأبلغ المستخدم بكلمة المرور الجديدة بطريقة آمنة." if approve else ""))
 
     def users_toggle_admin(self):
         admin = bool(self.u_admin_var.get())
@@ -7671,6 +7782,12 @@ def main():
     def open_app(user):
         root.deiconify()
         ElhagryERP(root, user, on_logout=start_login)
+        if user.get("is_admin"):
+            n = _engine.pending_password_request_count()
+            if n:
+                root.after(800, lambda: messagebox.showinfo(
+                    "طلبات كلمة المرور", f"يوجد {n} طلب إعادة تعيين كلمة مرور معلق.\n"
+                                         "راجعه من «المستخدمون والصلاحيات» ← طلبات إعادة تعيين كلمة المرور."))
         if _engine.MIGRATION_NOTE and not state["note_shown"]:
             state["note_shown"] = True
             root.after(400, lambda: messagebox.showinfo("تحديث قاعدة البيانات", _engine.MIGRATION_NOTE))

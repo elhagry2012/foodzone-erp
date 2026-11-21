@@ -935,6 +935,20 @@ CREATE TABLE IF NOT EXISTS users (
     role_id INTEGER,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+-- طلبات «نسيت كلمة المرور»: يراجعها المدير ويعيّن كلمة جديدة مشفرة أو يرفض (لا تغيير تلقائي أبداً)
+CREATE TABLE IF NOT EXISTS password_reset_requests (
+    request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    user_id INTEGER,
+    note TEXT,
+    status TEXT NOT NULL DEFAULT 'معلق',
+    requested_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime')),
+    source TEXT,
+    resolved_at TEXT,
+    resolved_by TEXT,
+    admin_note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pwreq_status ON password_reset_requests(status, requested_at);
 """
 
 # حركات المخزون الموحدة: الفاتورة المباشرة + التسليم/الاستلام.
@@ -1369,6 +1383,117 @@ def delete_user_account(uid, current_user_id=None):
             raise UserError("لا يمكن حذف آخر مدير نشط.")
         conn.execute("DELETE FROM users WHERE user_id=?", (uid,))
     return r[0]
+
+
+# ============================================================
+# «نسيت كلمة المرور؟»: طلب من شاشة الدخول ← مراجعة المدير (تعيين كلمة جديدة مشفرة أو رفض)
+# ============================================================
+PW_REQ_PENDING, PW_REQ_DONE, PW_REQ_REJECTED = "معلق", "مكتمل", "مرفوض"
+PW_REQ_STATUSES = (PW_REQ_PENDING, PW_REQ_DONE, PW_REQ_REJECTED)
+PW_REQ_NOTE_MAX = 300
+PW_REQ_MAX_PENDING = 50          # سقف الطلبات المعلقة كلها (حماية من الإغراق)
+PW_REQ_SENT_MSG = ("تم تسجيل طلبك. إذا كان اسم المستخدم مسجلاً فسيراجع مدير النظام الطلب ويبلغك بكلمة المرور الجديدة.\n"
+                   "لن تتغير كلمة المرور الحالية إلا بعد موافقة المدير.")
+
+
+def _pw_audit(conn, title, username, info):
+    from . import audit as _audit   # استيراد متأخر: audit يعتمد على engine
+    _audit.audit_event(conn, _audit.ACT_EVENT, title, username, new=info, table_name="password_reset_requests")
+
+
+def request_password_reset(username, note="", source="desktop"):
+    """طلب إعادة تعيين من شاشة الدخول (بدون تسجيل دخول). يرجع نفس الرسالة دائماً سواء كان المستخدم موجوداً أم لا
+    (لا يكشف أسماء المستخدمين)، ولا يغيّر أي كلمة مرور. الطلب يُحفظ «معلق» فقط لمستخدم موجود، وطلب معلق واحد لكل
+    مستخدم (التكرار يحدّث الملاحظة والوقت)، ويُسجَّل في سجل التدقيق."""
+    username = (username or "").strip()
+    note = (note or "").strip()[:PW_REQ_NOTE_MAX]
+    if not username:
+        raise UserError("أدخل اسم المستخدم.")
+    if len(username) > 60:
+        raise UserError("اسم المستخدم غير صالح.")
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db() as conn:
+        row = conn.execute("SELECT user_id, username FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
+        if row is None:
+            return PW_REQ_SENT_MSG
+        uid, uname = row
+        pending = conn.execute("SELECT request_id FROM password_reset_requests WHERE user_id=? AND status=?",
+                               (uid, PW_REQ_PENDING)).fetchone()
+        if pending:
+            conn.execute("UPDATE password_reset_requests SET note=?, requested_at=?, source=? WHERE request_id=?",
+                         (note, stamp, source, pending[0]))
+            rid = pending[0]
+        else:
+            (n,) = conn.execute("SELECT COUNT(*) FROM password_reset_requests WHERE status=?", (PW_REQ_PENDING,)).fetchone()
+            if n >= PW_REQ_MAX_PENDING:
+                return PW_REQ_SENT_MSG
+            rid = conn.execute("INSERT INTO password_reset_requests (username, user_id, note, status, requested_at, source) "
+                               "VALUES (?,?,?,?,?,?)", (uname, uid, note, PW_REQ_PENDING, stamp, source)).lastrowid
+        _pw_audit(conn, "طلب إعادة تعيين كلمة المرور (نسيت كلمة المرور)", uname,
+                  {"رقم الطلب": rid, "الحالة": PW_REQ_PENDING, "المصدر": source, "ملاحظة": note})
+    return PW_REQ_SENT_MSG
+
+
+def list_password_requests(status=None):
+    """[(رقم الطلب، اسم المستخدم، الاسم الكامل، الملاحظة، الحالة، وقت الطلب، المصدر، وقت المعالجة، بواسطة، ملاحظة المدير)]"""
+    sql = ("SELECT r.request_id, r.username, COALESCE(u.full_name,''), COALESCE(r.note,''), r.status, r.requested_at, "
+           "COALESCE(r.source,''), COALESCE(r.resolved_at,''), COALESCE(r.resolved_by,''), COALESCE(r.admin_note,'') "
+           "FROM password_reset_requests r LEFT JOIN users u ON u.user_id=r.user_id")
+    params = ()
+    if status:
+        sql += " WHERE r.status=?"
+        params = (status,)
+    with db() as conn:
+        return conn.execute(sql + " ORDER BY (r.status != ?), r.requested_at DESC, r.request_id DESC",
+                            params + (PW_REQ_PENDING,)).fetchall()
+
+
+def pending_password_request_count():
+    try:
+        with db() as conn:
+            return conn.execute("SELECT COUNT(*) FROM password_reset_requests WHERE status=?",
+                                (PW_REQ_PENDING,)).fetchone()[0]
+    except sqlite3.Error:
+        return 0
+
+
+def _require_admin(action):
+    u = _CURRENT_PERMS.get()
+    if u is not None and not u.get("is_admin"):
+        raise UserError(f"«{action}» لمدير النظام فقط.")
+
+
+def resolve_password_request(request_id, approve, new_password="", new_password2="", admin_note=""):
+    """مراجعة المدير: approve=True ← تعيين كلمة مرور جديدة (مشفرة PBKDF2) وفك أي قفل، والطلب «مكتمل».
+    approve=False ← «مرفوض» دون أي تغيير. الطلب المعالج لا يُعالج مرة أخرى. كلمة المرور لا تُسجَّل في أي مكان."""
+    _require_admin("مراجعة طلبات إعادة تعيين كلمة المرور")
+    admin_note = (admin_note or "").strip()[:PW_REQ_NOTE_MAX]
+    if approve:
+        if new_password != new_password2:
+            raise UserError("كلمتا المرور غير متطابقتين.")
+        validate_new_password(new_password or "")
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db() as conn:
+        r = conn.execute("SELECT user_id, username, status FROM password_reset_requests WHERE request_id=?",
+                         (request_id,)).fetchone()
+        if r is None:
+            raise UserError("الطلب غير موجود.")
+        uid, uname, status = r
+        if status != PW_REQ_PENDING:
+            raise UserError(f"الطلب رقم {request_id} تمت معالجته بالفعل ({status}).")
+        new_status = PW_REQ_DONE if approve else PW_REQ_REJECTED
+        if approve:
+            if conn.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone() is None:
+                raise UserError(f"المستخدم «{uname}» لم يعد موجوداً؛ ارفض الطلب.")
+            conn.execute("UPDATE users SET password_hash=?, failed_attempts=0, locked_until=NULL WHERE user_id=?",
+                         (hash_password(new_password), uid))
+        conn.execute("UPDATE password_reset_requests SET status=?, resolved_at=?, resolved_by=?, admin_note=? "
+                     "WHERE request_id=?", (new_status, stamp, current_user_name(), admin_note, request_id))
+        _pw_audit(conn, "مراجعة طلب إعادة تعيين كلمة المرور", uname,
+                  {"رقم الطلب": request_id, "الحالة": new_status, "ملاحظة المدير": admin_note,
+                   "تغيير كلمة المرور": "نعم (مشفرة)" if approve else "لا"})
+    return (f"تم تعيين كلمة مرور جديدة للمستخدم {uname} وإكمال الطلب." if approve
+            else f"تم رفض طلب المستخدم {uname} دون أي تغيير.")
 
 
 def list_users():

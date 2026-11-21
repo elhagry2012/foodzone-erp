@@ -702,7 +702,16 @@ def login_page():
             username = st.text_input("اسم المستخدم", autocomplete="username")
             password = st.text_input("كلمة المرور", type="password", autocomplete="current-password")
             ok = st.form_submit_button("دخول", width="stretch", type="primary")
-        st.caption("لأمان النظام لا تُستعاد كلمة المرور تلقائياً؛ تواصل مع مدير النظام لإعادة تعيينها.")
+        with st.expander("🔑 نسيت كلمة المرور؟"):
+            st.caption("يُرسل طلب لمدير النظام للمراجعة. كلمة المرور الحالية لا تتغير إلا بعد موافقته.")
+            with st.form("forgot_pw", clear_on_submit=True):
+                f_user = st.text_input("اسم المستخدم", key="forgot_user")
+                f_note = st.text_area("ملاحظة للمدير (اختياري)", max_chars=F.PW_REQ_NOTE_MAX, key="forgot_note")
+                sent = st.form_submit_button("إرسال الطلب", width="stretch")
+            if sent:
+                ok_r, msg = run_safe(F.request_password_reset, f_user, f_note, "web")
+                if ok_r:
+                    st.success(msg)
         if ok:
             try:
                 user = F.authenticate(username, password)
@@ -2153,11 +2162,47 @@ def _import_result(kind, res, preview):
 # ============================================================
 # المستخدمون والصلاحيات (للمدير فقط)
 # ============================================================
+def password_requests_section():
+    """طلبات «نسيت كلمة المرور؟»: المدير يعيّن كلمة مرور جديدة مشفرة (مكتمل) أو يرفض (مرفوض)."""
+    n = F.pending_password_request_count()
+    with st.expander(f"🔑 طلبات إعادة تعيين كلمة المرور — {n} معلق" if n else "🔑 طلبات إعادة تعيين كلمة المرور",
+                     expanded=bool(n)):
+        only = st.checkbox("المعلقة فقط", True, key="pwreq_only")
+        rows = F.list_password_requests(F.PW_REQ_PENDING if only else None)
+        if not rows:
+            st.caption("لا توجد طلبات.")
+            return
+        table(pd.DataFrame([(r[0], r[1], r[2], r[5], r[3], r[4], r[8], r[7], r[9]) for r in rows],
+                           columns=["رقم", "المستخدم", "الاسم", "وقت الطلب", "ملاحظة المستخدم", "الحالة", "عالجه",
+                                    "وقت المعالجة", "ملاحظة المدير"]), reverse=False)
+        pend = {r[0]: r for r in rows if r[4] == F.PW_REQ_PENDING}
+        if not pend:
+            return
+        rid = st.selectbox("الطلب", list(pend), format_func=lambda i: f"#{i} — {pend[i][1]} — {pend[i][5]}",
+                           key="pwreq_pick")
+        c1, c2 = st.columns(2)
+        p1 = c1.text_input("كلمة المرور الجديدة", type="password", key=f"pwreq_p1_{rid}")
+        p2 = c2.text_input("تأكيد كلمة المرور", type="password", key=f"pwreq_p2_{rid}")
+        anote = st.text_input("ملاحظة المدير (اختياري)", key=f"pwreq_n_{rid}")
+        b1, b2 = st.columns(2)
+        if b1.button("✅ تعيين كلمة المرور وإكمال الطلب", type="primary", key=f"pwreq_ok_{rid}"):
+            ok_r, msg = run_safe(F.resolve_password_request, rid, True, p1, p2, anote)
+            if ok_r:
+                flash(msg + " أبلغ المستخدم بكلمة المرور الجديدة بطريقة آمنة.")
+                st.rerun()
+        if b2.button("⛔ رفض الطلب", key=f"pwreq_no_{rid}"):
+            ok_r, msg = run_safe(F.resolve_password_request, rid, False, "", "", anote)
+            if ok_r:
+                flash(msg)
+                st.rerun()
+
+
 def page_users():
     header("👤 المستخدمون والصلاحيات")
     if not U()["is_admin"]:
         st.error("هذه الصفحة لمدير النظام فقط.")
         return
+    password_requests_section()
     users = F.list_users()
     df = pd.DataFrame([(u[1], u[2], "مدير" if u[3] else "مستخدم", "نشط" if u[4] else "موقوف", u[6] or "-",
                         "مقفل مؤقتاً" if u[8] else "") for u in users],

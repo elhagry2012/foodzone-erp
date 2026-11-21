@@ -107,3 +107,24 @@ def test_party_reports_render_in_web(web, key, mode):
     assert not [e.value for e in at.error], [e.value for e in at.error]
     word = {"summary": "إجماليات", "detail": "تفاصيل"}[mode]
     assert any(word in m.value for m in at.markdown if m.value.startswith("###")), mode
+
+
+def test_web_login_forgot_password_and_admin_review(web):
+    F, user = web
+    F.save_user_account(None, "clerk.w", "موظف", "Clerk-1234", "Clerk-1234", False, True, ["dashboard"])
+    at = AppTest.from_file(APP, default_timeout=120)
+    at.run()                                                     # شاشة الدخول (بدون جلسة)
+    assert any("نسيت كلمة المرور" in e.label for e in at.expander)
+    at.text_input(key="forgot_user").set_value("clerk.w")
+    at.text_area(key="forgot_note").set_value("طلب من الويب")
+    next(b for b in at.button if b.label == "إرسال الطلب").click().run()
+    assert not at.exception and any("تم تسجيل طلبك" in s.value for s in at.success)
+    assert [r[1] for r in F.list_password_requests(F.PW_REQ_PENDING)] == ["clerk.w"]
+    at = _run(user, "users")
+    assert not at.exception
+    at.text_input(key=f"pwreq_p1_{F.list_password_requests()[0][0]}").set_value("Web-New-123")
+    rid = F.list_password_requests()[0][0]
+    at.text_input(key=f"pwreq_p2_{rid}").set_value("Web-New-123")
+    at.button(key=f"pwreq_ok_{rid}").click().run()
+    assert not at.exception and F.list_password_requests()[0][4] == F.PW_REQ_DONE
+    assert F.authenticate("clerk.w", "Web-New-123")
