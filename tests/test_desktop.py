@@ -87,3 +87,43 @@ def test_customer_credit_fields_and_block_override(app):
     oid = erp.with_credit(F.create_order, "sales", F.today(), w["cust"], "", [F.make_line("ELH-T1", "x", "KG", 10, 20)])
     assert oid
     assert not errors, errors
+
+
+def test_dashboard_sources_and_hw_pl_compare_windows(app):
+    erp, errors, w = app
+    erp.show_page("dashboard")
+    erp.root.update_idletasks()
+    assert "OpEx" in erp.dash_formula.cget("text") or "بيعية" in erp.dash_formula.cget("text")
+    erp.open_dashboard_sources()
+    erp.show_page("import")
+    erp.root.update_idletasks()
+    for loader in erp.tab_loaders.values():
+        try:
+            loader()
+        except Exception:  # noqa: BLE001
+            pass
+    if getattr(erp, "hw", None) and erp.hw.get("tree") is not None:
+        erp._hw_show_pl_compare()
+        erp._hw_agg_refresh()
+    assert not errors, errors
+
+
+def test_voucher_attachments_window_and_security_form(app, tmp_path, monkeypatch):
+    erp, errors, w = app
+    F = w["F"]
+    from elhagry_core import engine as E
+    monkeypatch.setattr(E, "ATTACH_DIR", str(tmp_path / "att"))
+    vid = F.save_voucher("قبض", "2026-01-11", "صندوق نقدية الرياض", F.CAT_PARTNER, w["cust"], 50)
+    F.add_attachment("voucher", vid, "r.pdf", b"%PDF")
+    erp.show_page("cash")
+    erp.root.update_idletasks()
+    erp.load_cash_transactions()
+    assert erp.cash_tree.item(str(vid))["values"][-1] == "📎1"
+    erp.cash_tree.selection_set(str(vid))
+    erp.open_voucher_attachments_selected()
+    erp.show_page("company")
+    erp.root.update_idletasks()
+    for name in ("admin_pwd_e", "reset_pwd_e"):
+        if hasattr(erp, name):
+            assert getattr(erp, name).get() == ""        # كلمات المرور لا تُعرض أبداً
+    assert not errors, errors

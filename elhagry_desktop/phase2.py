@@ -84,7 +84,7 @@ class Phase2Mixin:
         pwd = A.simpledialog.askstring("تجاوز الحد الائتماني", f"{err}\n\nللمتابعة أدخل كلمة مرور المدير:", show="*")
         if pwd is None:
             return False
-        if pwd != A.get_setting("admin_password", "2026"):
+        if not A._engine.verify_modify_password(pwd):
             raise A.UserError("كلمة المرور غير صحيحة. تم إلغاء العملية.")
         return True
 
@@ -448,7 +448,14 @@ class Phase2Mixin:
             return
         vals = tree.item(iid, "values")
         try:
-            if key in self.DRILL_STATEMENT and vals and vals[0]:
+            if key in A.PARTY_REPORTS and vals:
+                # تقارير العملاء/الموردين/المقاصة: الكود في أول عمود (أو عمود المورد في المقاصة)؛ سطور الحركات بلا كود
+                code = next((str(v).split(" ، ")[0] for v in vals[:2 if key == "pt_net" else 1]
+                             if str(v).strip() and str(v) != "-"), None)
+                if code:
+                    self._trail_push_report()
+                    self.open_statement_for(code, {"pt_cust": "customer", "pt_supp": "supplier"}.get(key, "both"))
+            elif key in self.DRILL_STATEMENT and vals and vals[0]:
                 self._trail_push_report()
                 self.open_statement_for(vals[0], self.DRILL_STATEMENT[key])
             elif key in ("open_inv_c", "open_inv_s") and vals:

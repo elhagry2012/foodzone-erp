@@ -155,6 +155,32 @@ def audit_event(conn, action, doc_type, doc_ref="", old=None, new=None, table_na
                  (ts, u, src, action, doc_type, table_name, ref, o, n, changed, h))
 
 
+AUDIT_GUARD_SQL = """
+CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'سجل التدقيق غير قابل للتعديل'); END;
+CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'سجل التدقيق غير قابل للحذف'); END;
+"""
+
+
+def clear_audit_log(conn, backup_name, deleted=None):
+    """مسح سجل التدقيق بالكامل عند التصفير فقط (داخل معاملة التصفير وبعد نسخته الاحتياطية).
+    يُرفع مشغل منع الحذف مؤقتاً ثم يُعاد فوراً، ويُصفَّر الترقيم، ويُكتب سطر افتتاحي يبدأ سلسلة بصمات جديدة.
+    يرجع عدد السطور الممسوحة."""
+    (n,) = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+    conn.execute("DROP TRIGGER IF EXISTS audit_log_no_delete")
+    conn.execute("DELETE FROM audit_log")
+    for stmt in AUDIT_GUARD_SQL.strip().split("END;"):
+        if stmt.strip():
+            conn.execute(stmt + "END;")
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone():
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='audit_log'")
+    audit_event(conn, ACT_EVENT, "تصفير الحركات ومسح سجل التدقيق", "بداية سجل جديد",
+                new={"backup": backup_name, "audit_rows_cleared": n,
+                     "documents_deleted": sum((deleted or {}).values())})
+    return n
+
+
 def lines_snapshot(conn, table, key_col, key, cols):
     rows = conn.execute(f"SELECT {', '.join(cols)} FROM {table} WHERE {key_col}=? ORDER BY rowid", (key,)).fetchall()
     return [dict(zip(cols, r)) for r in rows]

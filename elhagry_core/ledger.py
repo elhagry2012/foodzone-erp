@@ -274,16 +274,22 @@ def _post_receipt(conn, A, rid):
 
 def _post_purchase_invoice(conn, A, pid):
     h = conn.execute("SELECT purchase_date, supplier_code, supplier_name, vat_amount, total_amount, "
-                     "COALESCE(invoice_no, purchase_id) FROM purchase_invoices WHERE purchase_id=?", (pid,)).fetchone()
+                     "COALESCE(invoice_no, purchase_id), COALESCE(source_type,'') FROM purchase_invoices WHERE purchase_id=?",
+                     (pid,)).fetchone()
     if h is None:
         return []
-    d, code, name, vat, total, no = h
+    d, code, name, vat, total, no, src = h
     (linked,) = conn.execute("SELECT COALESCE(SUM(subtotal),0) FROM purchase_invoice_lines WHERE purchase_id=? "
                              "AND receipt_line_id IS NOT NULL", (pid,)).fetchone()
     net = _r(total) - _r(vat)
     e = _Entry(d, str(no), f"فاتورة مشتريات {no} - {name}")
     e.dr(A["gl_acc_grni"], linked, "تسوية البضاعة المستلمة")
-    e.dr(A["gl_acc_stock"], net - _r(linked), "مشتريات مباشرة للمخزون")
+    if src == "HansaWorld":
+        # فاتورة تاريخية مستوردة بالإجمالي فقط (بلا أصناف): المخزون الفعلي أُدخل كرصيد افتتاحي من ملف التكلفة،
+        # فتُحمَّل المشتريات على تكلفة المبيعات حتى لا يتضخم حساب المخزون بمشتريات بيعت بالفعل.
+        e.dr(A["gl_acc_cogs"], net - _r(linked), "مشتريات تاريخية مستوردة (HansaWorld)")
+    else:
+        e.dr(A["gl_acc_stock"], net - _r(linked), "مشتريات مباشرة للمخزون")
     e.dr(A["gl_acc_vat_in"], vat, "ضريبة المدخلات 15%")
     e.cr(A["gl_acc_ap"], total, f"مستحقات المورد {name}", code)
     return [e]
@@ -312,8 +318,12 @@ def _post_return(conn, A, rid):
     return [e]
 
 
-def _partner_side(conn, code, alloc, ttype):
+def _partner_side(conn, code, alloc, ttype, tid=None):
     r = conn.execute("SELECT is_customer, is_supplier FROM business_partners WHERE partner_code=?", (code,)).fetchone()
+    if not alloc and tid is not None:   # سند موزّع على عدة فواتير: نوع فواتيره يحدد جهة الذمم
+        k = conn.execute("SELECT kind FROM advance_allocations WHERE trans_id=? ORDER BY alloc_id LIMIT 1",
+                         (tid,)).fetchone()
+        alloc = k[0] if k else alloc
     if alloc == "sales":
         return "c"
     if alloc == "purchase":
@@ -353,7 +363,7 @@ def _post_voucher(conn, A, tid, cash_map=None, leaves=None):
         cash = A["gl_acc_suspense"]
     partner = None
     if cat == CAT_PARTNER and pcode:
-        side = _partner_side(conn, pcode, alloc, ttype)
+        side = _partner_side(conn, pcode, alloc, ttype, tid)
         counter, partner = (A["gl_acc_ar"], pcode) if side == "c" else (A["gl_acc_ap"], pcode)
     elif pcode in leaves:
         counter = pcode

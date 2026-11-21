@@ -10,6 +10,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TMP = tempfile.mkdtemp(prefix="elhagry_tests_")
 os.environ["ELHAGRY_DB"] = os.path.join(_TMP, "boot.db")
 os.environ["ELHAGRY_DATA_DIR"] = _TMP
+# بيانات دخول الاختبار من البيئة (لا توجد بيانات ثابتة في الكود)، و .env الحقيقي لا يُحمَّل في الاختبارات
+os.environ["ELHAGRY_NO_DOTENV"] = "1"
+os.environ["ELHAGRY_ADMIN_USER"] = "test.admin"
+os.environ["ELHAGRY_ADMIN_PASSWORD"] = TEST_ADMIN_PASSWORD = "Test-Admin-2026"
+os.environ["ELHAGRY_RESET_PASSWORD"] = "2026"
+os.environ["ELHAGRY_MODIFY_PASSWORD"] = "2026"
+for _k in ("ELHAGRY_ADMIN_RESET", "ELHAGRY_ATTACH_DIR"):
+    os.environ.pop(_k, None)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 

@@ -23,7 +23,19 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-import elhagry_core as F
+
+def _secrets_to_env():
+    """Streamlit Secrets ← متغيرات البيئة قبل تحميل المحرك (ELHAGRY_DB، ELHAGRY_ADMIN_USER، كلمات المرور…)."""
+    try:
+        for k, v in st.secrets.items():
+            if str(k).startswith("ELHAGRY_") and isinstance(v, (str, int, float)):
+                os.environ.setdefault(str(k), str(v))
+    except Exception:  # noqa: BLE001  لا يوجد secrets.toml
+        pass
+
+
+_secrets_to_env()
+import elhagry_core as F  # noqa: E402
 
 APP_TITLE = F.BRAND_FULL
 SESSION_TIMEOUT_MIN = 30
@@ -647,7 +659,8 @@ def download_on_demand(label, key, builder, suffix, mime, filename, *args):
 def partners(role):
     col = "is_customer" if role == "customer" else "is_supplier"
     with F.db() as conn:
-        return conn.execute(f"SELECT partner_code, name FROM business_partners WHERE {col}=1 ORDER BY name").fetchall()
+        return conn.execute(f"SELECT partner_code, name FROM business_partners WHERE {col}=1 AND {F.ACTIVE_PARTNER_SQL} "
+                            "ORDER BY name").fetchall()
 
 
 def items():
@@ -758,6 +771,24 @@ def page_dashboard():
             if m.get(k)]
     if best:
         st.caption("   |   ".join(f"{t}: {v[0]} ({v[1]:,.2f})" for t, v in best))
+    st.caption(f"مجمل الربح = صافي المبيعات {m['sales']:,.2f} − تكلفة المبيعات {m['cogs']:,.2f} = {m['gross']:,.2f}   •   "
+               f"صافي الربح = مجمل الربح + إيرادات أخرى {m['other_income']:,.2f} − المصروفات التشغيلية {m['expenses']:,.2f} "
+               f"− الإهلاك {m['depreciation']:,.2f} = {m['profit']:,.2f}   •   المصروفات = بيعية وتسويقية (43) "
+               f"{m['opex_selling']:,.2f} + إدارية وعمومية (5) {m['opex_admin']:,.2f} + أخرى (41125…) {m['opex_other']:,.2f}")
+    for w in m.get("warnings") or []:
+        st.warning(w)
+    with st.expander("ℹ️ مصادر الأرقام ومطابقة قائمة الدخل مع HansaWorld"):
+        for key in ("dash_src", "hw_pl"):
+            if key not in F.REPORT_INDEX:
+                continue
+            ok_r, rep = run_safe(F.REPORT_INDEX[key][1], {})
+            if not ok_r:
+                continue
+            st.markdown(f"#### {rep.title}")
+            df = pd.DataFrame(rep.rows, columns=[c for c, _ in rep.columns])
+            table(df, money_cols=[c for c, k in rep.columns if k == "m"], reverse=False)
+            for n in rep.notes:
+                st.caption(n)
 
     ok, ch = run_safe(F.fetch_dashboard_charts, 6)
     if ok:
@@ -870,7 +901,7 @@ def invoice_body(kind, inv_id, on_pay=None):
 
 def attachments_box(doc_type, doc_id):
     """مرفقات المستند: عرض الصور مباشرة، تنزيل الملفات، ورفع ملفات جديدة."""
-    st.markdown("#### 📎 المرفقات (فاتورة المورد الأصلية / المستندات المؤيدة)")
+    st.markdown("#### 📎 المرفقات (المستند الأصلي / المستندات المؤيدة)")
     for aid, name, size, mime, by, at in F.list_attachments(doc_type, doc_id):
         _n, _m, data = F.get_attachment(aid)
         c1, c2 = st.columns([3, 1])
@@ -1306,7 +1337,7 @@ def page_inventory():
     header("🏭 المخزون وكارت الصنف")
     t1, t2 = st.tabs(["📦 أرصدة الأصناف", "🗂️ كارت الصنف"])
     with t1:
-        q = st.text_input("بحث بالكود أو الاسم أو الباركود أو الكود القديم", key="inv_q")
+        q = st.text_input("بحث بالكود أو الاسم أو الباركود", key="inv_q")
         with F.db() as conn:
             rows = conn.execute("SELECT item_code, item_name, unit, quantity, cost_price, quantity*cost_price, "
                                 "COALESCE(selling_price,0), COALESCE(barcode,''), COALESCE(legacy_code,'') "
@@ -1335,7 +1366,7 @@ def page_inventory():
             ok, res = run_safe(F.fetch_item_card, code, d1, d2)
             if ok:
                 rows, final = res
-                df = pd.DataFrame(rows, columns=["التاريخ", "الحركة", "الطرف", "الكمية", "الرصيد", "السعر", "القيمة", "ملاحظات"])
+                df = pd.DataFrame(rows, columns=["التاريخ", "الحركة", "الطرف", "الكمية", "الرصيد", "التكلفة", "القيمة بالتكلفة", "المرجع / ملاحظات"])
                 table(df, height=420)
                 final_text = f"الرصيد في نهاية الفترة: {final:,.3f}"
                 st.success(final_text)
@@ -1349,8 +1380,7 @@ def item_dialog(code):
     if not ok:
         return
     st.markdown(f"### {html.escape(d['name'])}")
-    st.caption(f"الكود: {d['code']}   |   الوحدة: {d['unit']}   |   الباركود: {d['barcode'] or '-'}   |   "
-               f"الكود القديم: {d['legacy'] or '-'}")
+    st.caption(f"الكود: {d['code']}   |   الوحدة: {d['unit']}   |   الباركود: {d['barcode'] or '-'}")
     m = st.columns(4)
     m[0].metric("الرصيد الحالي", f"{d['qty']:,.3f}")
     m[1].metric("متوسط التكلفة", money(d["cost"]))
@@ -1383,7 +1413,8 @@ def page_statement():
 def statement_body():
     cust_ok, supp_ok = can_fin("customer"), can_fin("supplier")
     with F.db() as conn:
-        rows = conn.execute("SELECT partner_code, name, is_customer, is_supplier FROM business_partners ORDER BY name").fetchall()
+        rows = conn.execute("SELECT partner_code, name, is_customer, is_supplier FROM business_partners "
+                            f"WHERE {F.ACTIVE_PARTNER_SQL} ORDER BY name").fetchall()
     allowed = [(c, n) for c, n, ic, is_ in rows if (ic and cust_ok) or (is_ and supp_ok)]
     if not allowed:
         st.warning("لا توجد صلاحية لعرض البيانات المالية للعملاء أو الموردين.")
@@ -1578,8 +1609,7 @@ def page_income():
 def can_report(key):
     if not can(F.REPORT_GROUP_OF.get(key, "reports")):
         return False
-    need = F.REPORT_FIN_REQUIRES.get(key)
-    return need is None or can_fin("customer" if need.startswith("sales") else "supplier")
+    return all(can_fin(role) for role in F.report_fin_needs(key))
 
 
 def page_reports():
@@ -1609,6 +1639,12 @@ def reports_body():
         expd = c4.number_input("تنبيه الصلاحية (يوم)", 0, 3650, 30, key="rep_exp")
     params = dict(d_from=d1, d_to=d2, group="month" if grp == "شهري" else "day", stale_days=int(stale),
                   late_days=int(late), expiry_days=int(expd))
+    if key in F.PARTY_REPORTS:
+        c1, c2, c3 = st.columns([2, 1.3, 1.6])
+        params["mode"] = c1.radio("العرض", list(F.PT_MODES), format_func=F.PT_MODES.get, horizontal=True,
+                                  key=f"pt_mode_{key}")
+        params["nonzero"] = c2.checkbox("الأرصدة غير الصفرية فقط", key=f"pt_nz_{key}")
+        params["shared_only"] = c3.checkbox("الأطراف المشتركة (عميل ومورد) فقط", key=f"pt_sh_{key}")
     if key == "sales_mgr":
         c1, c2 = st.columns(2)
         reps = [""] + F.rep_names() + [F.NO_REP]
@@ -1621,7 +1657,8 @@ def reports_body():
     ok, rep = run_safe(F.run_report, key, params)
     if not ok:
         return
-    render_report(rep, f"{key}_{d1}_{d2}", key=key)
+    extra = f"_{params['mode']}{int(params['nonzero'])}{int(params['shared_only'])}" if key in F.PARTY_REPORTS else ""
+    render_report(rep, f"{key}_{d1}_{d2}{extra}", key=key)
 
 
 OPEN_INV_KEYS = ("open_inv_c", "open_inv_s")
@@ -1639,7 +1676,13 @@ def _drill(key, rep, idx):
     if idx is None or idx >= len(rep.rows):
         return
     row = rep.rows[idx]
-    if key in DRILL_STATEMENT and row[0]:
+    if key in F.PARTY_REPORTS:
+        code = next((str(v).split(" ، ")[0] for v in row[:2 if key == "pt_net" else 1]
+                     if str(v or "").strip() and str(v) != "-"), None)
+        if code:
+            _open_statement(code, {"pt_cust": "customer", "pt_supp": "supplier"}.get(key, "both"))
+            st.rerun()
+    elif key in DRILL_STATEMENT and row[0]:
         _open_statement(row[0], DRILL_STATEMENT[key])
         st.rerun()
     elif key in OPEN_INV_KEYS:
@@ -1668,7 +1711,7 @@ def render_report(rep, dl_key, height=None, key=None):
     for c, k in kinds.items():
         if k != "t":
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    drill = key in DRILL_STATEMENT or key == "due_inv" or key in OPEN_INV_KEYS
+    drill = key in DRILL_STATEMENT or key == "due_inv" or key in OPEN_INV_KEYS or key in F.PARTY_REPORTS
     sel_key = f"drill_{dl_key}" if drill else None
     if drill:
         st.caption("🖱️ اضغط على أي سطر لفتحه في تبويب مجاور: " + ("كشف حساب الطرف التفصيلي (ومنه الفواتير والسداد)."
@@ -1683,7 +1726,15 @@ def render_report(rep, dl_key, height=None, key=None):
             _drill(key, rep, idx)
         # بديل مريح للمس (يظهر على كل الشاشات، وأساسي على الموبايل حيث يُعرض التقرير كبطاقات)
         opts = [i for i, r in enumerate(rep.rows) if r[0]]
-        if key in DRILL_STATEMENT:
+        if key in F.PARTY_REPORTS:   # سطر لكل طرف فقط (بدون الإجماليات الفرعية وسطور الحركات)
+            styles = getattr(rep, "row_styles", {}) or {}
+            opts = [i for i, r in enumerate(rep.rows) if (str(r[0]).strip() not in ("", "-") or
+                                                          (key == "pt_net" and str(r[1]).strip() not in ("", "-")))
+                    and styles.get(i) not in ("sub", "net")]
+            def label(i):
+                r = rep.rows[i]
+                return f"{r[0]} — {r[2] if key == 'pt_net' and r[2] else r[1]}"
+        elif key in DRILL_STATEMENT:
             label = lambda i: f"{rep.rows[i][1]} — {rep.rows[i][0]}"  # noqa: E731
         elif key in OPEN_INV_KEYS:
             label = lambda i: f"{rep.rows[i][0]} — {rep.rows[i][3]} (متبقي {money(rep.rows[i][8])})"  # noqa: E731
@@ -1898,9 +1949,8 @@ def page_partners(role):
     fin = can_fin(role)
     df = pd.DataFrame([(r[0], r[1], r[2] or "-", r[3] or "-", r[4] or "-",
                         (f"{abs(r[5]):,.2f} {'مدين' if r[5] > 0 else 'دائن'}" if abs(r[5]) > 0.005 else "-") if fin else "🔒",
-                        r[-1] or "-", r[6] or "-") for r in rows],
-                      columns=["الكود", "الاسم", "الهاتف", "الرقم الضريبي", "المندوب", "الرصيد الافتتاحي", "مرتبط بـ",
-                               "الكود القديم"])
+                        r[-1] or "-") for r in rows],
+                      columns=["الكود", "الاسم", "الهاتف", "الرقم الضريبي", "المندوب", "الرصيد الافتتاحي", "مرتبط بـ"])
     st.caption(f"العدد: {len(rows)}   |   «مرتبط بـ» = نفس الكيان في الشجرة الأخرى (يُربط تلقائياً بالاسم أو الرقم الضريبي "
                "لإجراء المقاصة في الكشف الموحد).   🖱️ اختر صفاً للتعديل.")
     sel = table(df, height=380, select_key=f"pp_tbl_{role}")
@@ -2152,7 +2202,7 @@ def page_users():
             conn.execute("UPDATE users SET failed_attempts=0, locked_until=NULL WHERE user_id=?", (uid,))
         flash("تم فك قفل المستخدم.")
         st.rerun()
-    if rec and rec[1] != F.DEFAULT_ADMIN_USER:
+    if rec and rec[1] != F.main_admin_user():
         confirm = b3.checkbox("تأكيد الحذف", key=f"usr_delc_{sfx}")
         if b3.button("🗑️ حذف المستخدم", disabled=not confirm, key=f"usr_del_{sfx}"):
             ok, name = run_safe(F.delete_user_account, uid, U()["user_id"])
@@ -2512,7 +2562,7 @@ def _voucher_parties(category):
     with F.db() as conn:
         if category == F.CAT_PARTNER:
             return [((c, n), f"{c} - {n}") for c, n in
-                    conn.execute("SELECT partner_code, name FROM business_partners ORDER BY name")]
+                    conn.execute(f"SELECT partner_code, name FROM business_partners WHERE {F.ACTIVE_PARTNER_SQL} ORDER BY name")]
         if category == F.CAT_EXPENSE:
             pairs = [((c, n), f"{c} - {n}") for c, n in conn.execute(
                 "SELECT account_code, account_name FROM chart_of_accounts WHERE account_type=? AND COALESCE(is_group,0)=0 "
@@ -2648,9 +2698,19 @@ def voucher_form(in_workspace=False):
                 st.metric("المتبقي بعد السداد", money(max(after, 0)),
                           "سداد كامل" if abs(after) < 0.005 else ("يتجاوز المتبقي!" if after < 0 else "سداد جزئي"),
                           delta_color="off", border=True)
+        spread = _allocation_grid(t_type, party, amount) if cat == F.CAT_PARTNER and party and party[0] else {}
         if st.button("💾 حفظ السند", type="primary", key="cv_save"):
             if F.period_is_closed(t_date.isoformat()) and not U()["is_admin"]:
                 st.error("هذا التاريخ مغلق بالإغلاق اليومي. التسجيل فيه للمدير فقط.")
+            elif spread:
+                ok, res = run_safe(F.save_allocated_voucher, t_type, t_date.isoformat(), bank, party, amount, spread, desc)
+                if ok:
+                    for k in ("cv_amount", "cv_desc", "cv_inv", "cash_pay_info", "cv_alloc_plan", "cv_spread"):
+                        st.session_state.pop(k, None)
+                    left = round((amount or 0) - res[1], 2)
+                    flash(f"تم حفظ السند رقم {res[0]} على «{bank}»، ووُزّع {money(res[1])} على {len(spread)} فاتورة" +
+                          (f"، والباقي {money(left)} تحت الحساب." if left > 0.005 else "."))
+                    st.rerun()
             else:
                 ok, vid = run_safe(F.save_voucher, t_type, t_date.isoformat(), bank, cat, party, amount, alloc, desc)
                 if ok:
@@ -2661,6 +2721,46 @@ def voucher_form(in_workspace=False):
                     if in_workspace and "invoice" in (st.session_state.get("ws_open") or []):
                         st.session_state["ws_active"] = "invoice"   # عرض الفاتورة بعد السداد (حالتها المحدّثة)
                     st.rerun()
+
+
+def _allocation_grid(t_type, party, amount):
+    """توزيع مبلغ السند على الفواتير المفتوحة للطرف (تلقائي الأقدم فالأحدث + تعديل يدوي). يرجع {inv_id: مبلغ}."""
+    if not st.toggle("توزيع السند على عدة فواتير مفتوحة", key="cv_spread"):
+        return {}
+    kind = "sales" if t_type == "قبض" else "purchase"
+    invs = F.party_open_invoices(kind, party[0])
+    if not invs:
+        st.info("لا توجد فواتير مفتوحة لهذا الطرف؛ سيُسجَّل السند دفعة تحت الحساب.")
+        return {}
+    sig = (kind, party[0])
+    plan = st.session_state.get("cv_alloc_plan")
+    if not plan or plan[0] != sig:
+        plan = (sig, {}, 0)
+    if st.button(":material/bolt: توزيع تلقائي (الأقدم فالأحدث)", key="cv_auto"):
+        if not amount:
+            st.warning("أدخل مبلغ السند أولاً.")
+        else:
+            plan = (sig, F.fifo_allocation(invs, amount), plan[2] + 1)
+    st.session_state["cv_alloc_plan"] = plan
+    df = pd.DataFrame([dict(inv_id=r["inv_id"], رقم=r["no"], التاريخ=r["date"], الإجمالي=r["total"],
+                            المسدد_سابقاً=r["paid"], المتبقي=r["remaining"], المخصص=plan[1].get(r["inv_id"], 0.0))
+                       for r in invs])
+    ed = st.data_editor(df, key=f"cv_alloc_ed_{sig[1]}_{plan[2]}", hide_index=True, width="stretch",
+                        disabled=["رقم", "التاريخ", "الإجمالي", "المسدد_سابقاً", "المتبقي"],
+                        column_config={"inv_id": None,
+                                       "المسدد_سابقاً": st.column_config.NumberColumn("المسدد سابقاً", format="%.2f"),
+                                       "المخصص": st.column_config.NumberColumn("المخصص من السند", min_value=0.0,
+                                                                              format="%.2f")})
+    spread = {int(r.inv_id): round(float(r.المخصص or 0), 2) for r in ed.itertuples() if (r.المخصص or 0) > 0.005}
+    over = [r.رقم for r in ed.itertuples() if (r.المخصص or 0) > r.المتبقي + 0.005]
+    used = round(sum(spread.values()), 2)
+    if over:
+        st.error("المخصص أكبر من متبقي الفاتورة: " + "، ".join(over))
+    elif used > (amount or 0) + 0.005:
+        st.error(f"الموزع ({money(used)}) أكبر من مبلغ السند ({money(amount)}).")
+    else:
+        st.caption(f"الموزع: **{money(used)}** — غير موزع (تحت الحساب): **{money((amount or 0) - used)}**")
+    return spread
 
 
 def cash_registers():
@@ -2678,8 +2778,17 @@ def cash_registers():
             for col, (k, v) in zip(cols, items[i:i + 4]):
                 col.metric(k, money(v))
         st.markdown("#### 📒 آخر السندات")
-        table(pd.DataFrame(rows, columns=["رقم السند", "التاريخ", "النوع", "الحساب", "التصنيف", "الطرف", "المبلغ", "البيان"]),
+        att = F.attachment_counts("voucher")
+        table(pd.DataFrame([r + (f"📎{att[r[0]]}" if att.get(r[0]) else "",) for r in rows],
+                           columns=["رقم السند", "التاريخ", "النوع", "الحساب", "التصنيف", "الطرف", "المبلغ", "البيان", "📎"]),
               money_cols=["المبلغ"], height=420)
+        if rows:
+            pick = st.selectbox("📎 مرفقات سند (رفع / معاينة / تحميل)", [r[0] for r in rows], index=None,
+                                format_func=lambda t: next(f"سند {r[2]} رقم {r[0]} — {r[1]} — {r[5] or ''} — {money(r[6])}"
+                                                           for r in rows if r[0] == t),
+                                key="voucher_att_pick", placeholder="اختر السند")
+            if pick:
+                attachments_box("voucher", pick)
 
 
 def go_pay_invoice(kind, inv_id):

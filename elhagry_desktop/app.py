@@ -36,18 +36,20 @@ except Exception:  # pragma: no cover - بيئة بدون Tk
 
 from elhagry_core import engine as _engine
 from elhagry_core.engine import save_voucher, set_current_user, invoice_payment_prefill, NO_REP  # noqa: E402
-from elhagry_core import credit as _credit, audit as _audit  # noqa: E402
+from elhagry_core import credit as _credit  # noqa: E402
 from elhagry_desktop.phase2 import Phase2Mixin  # noqa: E402
 from elhagry_core.controls import user_role_id, party_advance_available  # noqa: E402
+from elhagry_core import controls as _controls  # noqa: E402
+from elhagry_core import hansa_import as _hansa  # noqa: E402
 from elhagry_core.engine import voucher_rep_info  # noqa: E402
 from elhagry_core.engine import (  # noqa: E402  — واجهة برمجة المحرك المستخدمة في الشاشات
-    ACCOUNT_TYPES, ALL_PERMISSION_KEYS, ATTACH_DOCS, ATTACH_EXTS, BANK_ACCOUNTS, BRAND_AR, BRAND_EN, BRAND_FULL,
-    CASH_OPENING_SETTING, CAT_ASSET, CAT_EMPLOYEE, CAT_EXPENSE, CAT_PARTNER, CHART_INK, CHART_PAL, CHART_PAL_DEFAULT,
-    CHART_TEXT, DASH_REFRESH_MS, DB_FILE, DEFAULT_ADMIN_USER, DEFAULT_EXPENSES, DISC_ACCOUNT_DEFAULTS,
+    ACCOUNT_TYPES, ACTIVE_PARTNER_SQL, ALL_PERMISSION_KEYS, ATTACH_DOCS, ATTACH_EXTS, BANK_ACCOUNTS, BRAND_AR, BRAND_EN, BRAND_FULL,
+    CAT_ASSET, CAT_EMPLOYEE, CAT_EXPENSE, CAT_PARTNER, CHART_INK, CHART_PAL, CHART_PAL_DEFAULT,
+    CHART_TEXT, DASH_REFRESH_MS, DB_FILE, DEFAULT_EXPENSES, DISC_ACCOUNT_DEFAULTS,
     DISC_KIND_LABEL, DISC_KIND_SHORT, DISC_METHOD_LABEL, DISC_PL, DISC_PURCHASE, DISC_SALES, DISC_STOCK,
     ELHAGRY_LOGO_FILES, EN_MONTHS, EPS, EXCEL_PATH, FLOW, HAS_AR_LIBS, IMPORT_KINDS, LOGIN_ACCENT, LOGIN_FORM_BG,
     LOGIN_PANEL_BG, NON_CASH_EXPENSE_PREFIXES, NegativeStockError, PERMISSIONS, PERMISSION_KEYS, PURCHASE_RETURN,
-    REPORT_CATALOG, REPORT_FIN_REQUIRES, REPORT_GROUP_OF, REPORT_INDEX, ROLE_LABEL, Report, SALES_RETURN,
+    PARTY_REPORTS, PT_MODES, REPORT_CATALOG, REPORT_GROUP_OF, REPORT_INDEX, ROLE_LABEL, Report, SALES_RETURN,
     SEQUENCE_DEFS, STALE_DAYS_DEFAULT, SUB_PARENT, SUB_PERMISSIONS, SUMMARY_HEADERS, SUMMARY_SCOPES, TYPE_ASSET,
     TYPE_EXP, UserError, _block_system_entry, _cur, _pct, _simple_report_pdf, account_statement, account_tree_rows,
     accumulated_depreciation, active_admin_count, add_attachment, all_unbilled, attachment_counts, authenticate,
@@ -58,7 +60,7 @@ from elhagry_core.engine import (  # noqa: E402  — واجهة برمجة ال�
     delete_attachment, delete_invoice, delete_item, delete_journal_entry, delete_partner, delete_post_discount,
     delete_rep, delete_return, delete_voucher, disc_accounts, discount_invoice_choices, employee_accounts,
     export_report_xlsx, extract_logo_image, fetch_dashboard_charts, fetch_dashboard_metrics, fetch_expiry_summary,
-    fetch_item_card, fetch_partner_statement, find_logo_file, fmt, fmt_cell, fulfil_order, get_attachment,
+    fetch_partner_statement, find_logo_file, report_fin_needs, fmt, fmt_cell, fulfil_order, get_attachment,
     get_cash_opening, get_setting, hash_password, import_chart_of_accounts, import_items_from_df,
     import_partner_openings_from_df, import_partners_from_df, import_preview_columns, import_stats_text, init_db,
     integrity_check, invoice_number, invoice_unbilled_selection, item_details,
@@ -1514,8 +1516,7 @@ class ElhagryERP(Phase2Mixin):
     def can_report(self, key):
         if not self.can(REPORT_GROUP_OF.get(key, "reports")):
             return False
-        need = REPORT_FIN_REQUIRES.get(key)
-        return need is None or self.can_fin("customer" if need.startswith("sales") else "supplier")
+        return all(self.can_fin(role) for role in report_fin_needs(key))
 
     def can_modify(self):
         """تعديل وحذف المستندات والأرصدة: المدير دائماً، أو مستخدم مُنح صلاحية «modify»."""
@@ -1652,8 +1653,6 @@ class ElhagryERP(Phase2Mixin):
                     stored = conn.execute("SELECT password_hash FROM users WHERE user_id=?", (self.user["user_id"],)).fetchone()
                     if not stored or not verify_password(cur, stored[0]):
                         raise UserError("كلمة المرور الحالية غير صحيحة.")
-                    if self.user.get("username") == DEFAULT_ADMIN_USER:
-                        raise UserError(f"بيانات دخول المدير الرئيسي «{DEFAULT_ADMIN_USER}» ثابتة ولا يمكن تغييرها.")
                     if new != new2:
                         raise UserError("كلمتا المرور الجديدتان غير متطابقتين.")
                     validate_new_password(new)
@@ -1878,8 +1877,8 @@ class ElhagryERP(Phase2Mixin):
                 r = conn.execute("SELECT username, is_admin, active FROM users WHERE user_id=?", (uid,)).fetchone()
                 if r is None:
                     return
-                if r[0] == DEFAULT_ADMIN_USER:
-                    raise UserError(f"لا يمكن حذف حساب المدير الرئيسي «{DEFAULT_ADMIN_USER}».")
+                if r[0] == _engine.main_admin_user():
+                    raise UserError(f"لا يمكن حذف حساب المدير الرئيسي «{r[0]}».")
                 if r[1] and r[2] and active_admin_count(conn, uid) == 0:
                     raise UserError("لا يمكن حذف آخر مدير نشط.")
             if not messagebox.askyesno("حذف مستخدم", f"حذف المستخدم {r[0]} نهائياً؟\n(البديل: إلغاء علامة «نشط» لإيقافه)"):
@@ -1916,36 +1915,38 @@ class ElhagryERP(Phase2Mixin):
                                    "وإرجاع المخزون للرصيد الافتتاحي.\n(دليل الحسابات والشركاء والأصناف والأصول لا تُحذف)\n\n"
                                    "هل تريد المتابعة؟", icon="warning"):
             return
-        word = simpledialog.askstring("تأكيد نهائي", 'للتأكيد اكتب كلمة: تصفير')
-        if (word or "").strip() != "تصفير":
+        clear_audit = messagebox.askyesnocancel(
+            "سجل التدقيق والرقابة",
+            "هل تريد مسح «سجل التدقيق والرقابة» أيضاً ليبدأ نظيفاً مع الاستيراد الفعلي؟\n\n"
+            "• نعم: يُمسح السجل بالكامل ويبدأ سجل جديد بسطر واحد يوثّق المسح (المستخدم والتوقيت وعدد السطور).\n"
+            "• لا: يبقى السجل كما هو ويُضاف إليه حدث التصفير.\n"
+            "• إلغاء: إيقاف التصفير.\n\n"
+            "في الحالتين تُؤخذ نسخة احتياطية كاملة تلقائياً قبل أي حذف (وتحتوي السجل القديم).", icon="warning")
+        if clear_audit is None:
+            messagebox.showinfo("إلغاء", "لم يتم التصفير.")
+            return
+        prompt = "أدخل كلمة مرور تصفير الحركات:"
+        if clear_audit:
+            prompt = "⚠️ سيتم تصفير الحركات ومسح سجل التدقيق والرقابة بالكامل.\n" + prompt
+        pwd = simpledialog.askstring("تأكيد نهائي", prompt, show="*")
+        if pwd is None:
             messagebox.showinfo("إلغاء", "لم يتم التصفير.")
             return
         try:
-            backup = backup_database("before_reset")
-            with db() as conn:
-                _audit.audit_event(conn, _audit.ACT_EVENT, "تصفير الحركات", "كل المستندات",
-                                   new={"backup": os.path.basename(backup)})
-                for table in ("sales_delivery_lines", "purchase_receipt_lines", "sales_invoice_lines", "purchase_invoice_lines",
-                              "sales_deliveries", "purchase_receipts", "sales_invoices", "purchase_invoices",
-                              "sales_order_lines", "purchase_order_lines", "sales_orders", "purchase_orders",
-                              "returns_invoices", "cash_transactions", "daily_closures", "post_discount_lines",
-                              "post_discounts", "journal_lines", "journal_entries"):
-                    conn.execute(f"DELETE FROM {table}")
-                # مرفقات المستندات المحذوفة: بدون حذفها ستظهر على المستندات الجديدة التي تأخذ نفس الأرقام
-                conn.execute("DELETE FROM attachments WHERE doc_type IN ('purchase', 'journal')")
-                conn.execute("UPDATE inventory SET quantity = opening_qty, cost_price = opening_cost")
-                conn.execute("UPDATE sequences SET next_value=1 WHERE name IN ('sales_invoice','purchase_invoice',"
-                             "'purchase_discount','sales_discount')")
-                conn.execute("DELETE FROM app_settings WHERE key=?", (CASH_OPENING_SETTING,))
-                conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('sales_invoices','sales_invoice_lines',"
-                             "'purchase_invoices','purchase_invoice_lines','returns_invoices','cash_transactions','daily_closures',"
-                             "'sales_orders','sales_order_lines','sales_deliveries','sales_delivery_lines','purchase_orders',"
-                             "'purchase_order_lines','purchase_receipts','purchase_receipt_lines','journal_entries','journal_lines',"
-                             "'post_discounts','post_discount_lines')")
-            self.refresh_all()
-            messagebox.showinfo("تم التصفير", f"أصبح النظام جاهزاً للعمل.\nنسخة ما قبل التصفير:\n{os.path.abspath(backup)}")
+            res = _engine.reset_transactions(pwd, clear_audit=bool(clear_audit))
         except Exception as e:
             handle_error(e)
+            return
+        n = sum(res["deleted"].values())
+        try:
+            self.refresh_all()
+            self._hw_agg_refresh()
+        except Exception as e:  # noqa: BLE001  التصفير نفسه تم؛ فشل تحديث الشاشات لا يلغيه
+            messagebox.showwarning("تنبيه", f"تم التصفير، لكن تعذر تحديث بعض الشاشات ({e}).\nأعد فتح البرنامج.")
+        audit_txt = (f"\nمُسح سجل التدقيق ({res['audit_cleared']:,} سطر) وبدأ سجل جديد."
+                     if res.get("audit_cleared") is not None else "\nسجل التدقيق محفوظ كما هو.")
+        messagebox.showinfo("تم التصفير", f"أصبح النظام جاهزاً للعمل (حُذف {n:,} سطر من الحركات).{audit_txt}\n"
+                                          f"نسخة ما قبل التصفير:\n{os.path.abspath(res['backup'])}")
 
     def refresh_all(self):
         self.refresh_flow("sales")
@@ -2054,7 +2055,8 @@ class ElhagryERP(Phase2Mixin):
         col = "is_customer" if flag == "customer" else "is_supplier"
         with db() as conn:
             return [(f"{c} - {n}", (c, n)) for c, n in
-                    conn.execute(f"SELECT partner_code, name FROM business_partners WHERE {col}=1 ORDER BY name")]
+                    conn.execute(f"SELECT partner_code, name FROM business_partners WHERE {col}=1 AND {ACTIVE_PARTNER_SQL} "
+                                 "ORDER BY name")]
 
     def print_sales_invoice_pdf(self, event=None):
         sel = self.sal_tree.selection()
@@ -2411,39 +2413,139 @@ class ElhagryERP(Phase2Mixin):
 
         win = tk.Toplevel(self.root)
         win.title(f"كارت الصنف التفصيلي: {item_name} ({item_code})")
-        win.geometry("1150x650")
+        win.geometry("1400x720")
         tk.Label(win, text=f"📊 كارت الصنف التفصيلي: {item_name} (الكود: {item_code})",
-                 font=("Arial", 13, "bold"), fg="#1e293b", pady=10).pack()
+                 font=("Arial", 13, "bold"), fg="#1e293b", pady=8).pack()
 
-        ff = ttk.LabelFrame(win, text=" فلترة الحركة بالفترة الزمنية ", padding=10)
-        ff.pack(fill="x", padx=15, pady=5)
-        d_from_e = date_entry(ff, 14, f"{date.today().year}-01-01")
-        d_to_e = date_entry(ff, 14)
-        state = {"rows": [], "final": ""}
+        ALL = "الكل"
+        ff = ttk.LabelFrame(win, text=" الفترة والفلترة والتتبع ", padding=8)
+        ff.pack(fill="x", padx=15, pady=4)
+        d_from_e = date_entry(ff, 12, _engine.item_first_move_date(item_code) or f"{date.today().year}-01-01")
+        d_to_e = date_entry(ff, 12)
+        src_cb = ttk.Combobox(ff, values=[ALL, *_engine.ITEM_CARD_SOURCES], width=12, state="readonly")
+        src_cb.set(ALL)
+        type_cb = ttk.Combobox(ff, values=[ALL], width=24, state="readonly")
+        type_cb.set(ALL)
+        dir_cb = ttk.Combobox(ff, values=[ALL, "وارد فقط", "صادر فقط"], width=10, state="readonly")
+        dir_cb.set(ALL)
+        q_e = ttk.Entry(ff, width=28)
+        linked_var = tk.BooleanVar(value=False)
+        state = {"card": None, "shown": [], "rows": [], "final": "", "d1": ""}
 
         box = tk.Frame(win)
-        box.pack(fill="both", expand=True, padx=15, pady=5)
-        tree = make_tree(box, [("date", "التاريخ", 90, "center"), ("type", "نوع الحركة", 150, "center"),
-                               ("party", "الطرف", 170, "e"), ("qty", "الكمية", 90, "center"),
-                               ("bal", "الرصيد", 100, "center"), ("price", "السعر/التكلفة", 100, "center"),
-                               ("val", "القيمة", 100, "center"), ("notes", "ملاحظات", 150, "center")])
-        bottom = tk.Frame(win, pady=8)
+        box.pack(fill="both", expand=True, padx=15, pady=4)
+        tree = make_tree(box, [("date", "التاريخ", 88, "center"), ("src", "المصدر", 88, "center"),
+                               ("type", "نوع الحركة", 150, "center"), ("ref", "رقم المستند / المرجع", 125, "center"),
+                               ("link", "المستند المربوط", 120, "center"), ("pcode", "كود الطرف", 70, "center"),
+                               ("party", "العميل / المورد", 210, "e"), ("in", "وارد", 80, "center"),
+                               ("out", "صادر", 80, "center"), ("bal", "الرصيد المتحرك", 100, "center"),
+                               ("cost", "التكلفة", 80, "center"), ("val", "القيمة بالتكلفة", 100, "center"),
+                               ("notes", "ملاحظات", 170, "e")], rtl=True)
+        tree.tag_configure("open", background="#eef2ff", font=("Arial", 9, "bold"))
+        tree.tag_configure("hw", foreground="#475569")
+        bottom = tk.Frame(win, pady=6)
         bottom.pack(fill="x")
-        lbl = tk.Label(bottom, text="", font=("Arial", 11, "bold"), fg="#16a34a")
-        lbl.pack(side="right", padx=20)
+        lbl = tk.Label(bottom, text="", font=("Arial", 10, "bold"), fg="#16a34a", justify="right")
+        lbl.pack(side="right", padx=15)
+        keys = {}
+
+        def q3(v):
+            return f"{v:,.3f}" if v else ""
+
+        def render(*_):
+            card = state["card"]
+            if card is None:
+                return
+            src, typ, direction = src_cb.get(), type_cb.get(), dir_cb.get()
+            q = _engine.search_norm(q_e.get())
+            shown = []
+            for m in card["moves"]:
+                if src != ALL and m["src"] != src or typ != ALL and m["type"] != typ:
+                    continue
+                if direction == "وارد فقط" and m["qty"] <= 0 or direction == "صادر فقط" and m["qty"] >= 0:
+                    continue
+                if linked_var.get() and not (m["link"] or m["src"] == "النظام"):
+                    continue
+                if q and q not in _engine.search_norm(" ".join(str(m[k]) for k in ("ref", "link", "party_code", "party",
+                                                                                     "notes", "type"))):
+                    continue
+                shown.append(m)
+            clear_tree(tree)
+            keys.clear()
+            tree.insert("", "end", values=(state["d1"], "-", card["opening_label"], "-", "", "", "-", "", "",
+                                           f"{card['opening']:,.3f}", "", "", ""), tags=("open",))
+            for m in shown:
+                iid = tree.insert("", "end", values=(m["date"], m["src"], m["type"], m["ref"], m["link"] or "-",
+                                                     m["party_code"] or "-", m["party"], q3(m["qty_in"]), q3(m["qty_out"]),
+                                                     f"{m['balance']:,.3f}", fmt(m["cost"]), fmt(m["value"]),
+                                                     m["notes"] or ""),
+                                  tags=("hw",) if m["src"] == "HansaWorld" else ())
+                keys[iid] = m
+            state["shown"] = shown
+            state["rows"] = _engine.item_card_rows(card, shown, state["d1"])
+            t_in = sum(m["qty_in"] for m in shown)
+            t_out = sum(m["qty_out"] for m in shown)
+            v_in = sum(m["value"] for m in shown if m["qty"] > 0)
+            v_out = sum(m["value"] for m in shown if m["qty"] < 0)
+            filt = "" if len(shown) == len(card["moves"]) else f" (معروض {len(shown):,} من {len(card['moves']):,} حركة بالفلتر)"
+            state["final"] = f"الرصيد في نهاية الفترة: {card['final']:,.3f}"
+            lbl.config(text=f"{state['final']}   •   عدد الحركات: {len(card['moves']):,}{filt}\n"
+                            f"وارد {t_in:,.3f} (بالتكلفة {fmt(v_in)})   •   صادر {t_out:,.3f} (بالتكلفة {fmt(v_out)})   •   "
+                            f"متوسط التكلفة الحالي {fmt(card['cost'])}")
 
         def load():
             d1, d2 = parse_date(d_from_e.get()), parse_date(d_to_e.get())
             if not d1 or not d2:
                 messagebox.showwarning("تنبيه", "صيغة التاريخ YYYY-MM-DD", parent=win)
                 return
-            rows, final = fetch_item_card(item_code, d1, d2)
-            clear_tree(tree)
-            for r in rows:
-                tree.insert("", "end", values=r)
-            state["rows"] = rows
-            state["final"] = f"الرصيد في نهاية الفترة: {final:,.3f}"
-            lbl.config(text=state["final"])
+            try:
+                card = _engine.item_card(item_code, d1, d2)
+            except Exception as e:
+                handle_error(e)
+                return
+            state["card"], state["d1"] = card, d1
+            types = sorted({m["type"] for m in card["moves"]})
+            type_cb.config(values=[ALL, *types])
+            if type_cb.get() not in types:
+                type_cb.set(ALL)
+            render()
+
+        def current():
+            sel = tree.selection()
+            return keys.get(sel[0]) if sel else None
+
+        def open_doc(event=None):
+            m = current()
+            if not m:
+                return
+            key = m.get("key")
+            try:
+                if key and key[0] in ("sales", "purchase", "return", "discount"):
+                    self.show_transaction_details(key)
+                elif m["party_code"]:
+                    open_partner()
+                else:
+                    messagebox.showinfo("تتبع", "لا يوجد مستند أو طرف مربوط بهذه الحركة.", parent=win)
+            except Exception as e:
+                handle_error(e)
+
+        def open_partner():
+            m = current()
+            if not m or not m["party_code"]:
+                messagebox.showinfo("تتبع", "اختر حركة لها كود عميل/مورد.", parent=win)
+                return
+            try:
+                self.open_statement_for(m["party_code"])
+            except Exception as e:
+                handle_error(e)
+
+        def same_party():
+            m = current()
+            if not m:
+                return
+            q_e.delete(0, tk.END)
+            q_e.insert(0, m["party_code"] or m["party"])
+            render()
 
         def export():
             path = filedialog.asksaveasfilename(parent=win, defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")],
@@ -2456,9 +2558,37 @@ class ElhagryERP(Phase2Mixin):
             except Exception as e:
                 handle_error(e)
 
-        rtl_row(ff, 0, [("من تاريخ:", d_from_e), ("إلى تاريخ:", d_to_e),
-                        (None, money_button(ff, "تطبيق الفلتر 🔍", "#0284c7", load, 9))], slots=3)
-        money_button(bottom, "🖨️ طباعة كارت الصنف (PDF)", "#2563eb", export).pack(side="left", padx=20)
+        def export_xlsx():
+            path = filedialog.asksaveasfilename(parent=win, defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")],
+                                                title="حفظ كارت الصنف", initialfile=f"كارت_صنف_{item_code}.xlsx")
+            if not path:
+                return
+            cols = [("التاريخ", "t"), ("المصدر", "t"), ("نوع الحركة", "t"), ("رقم المستند / المرجع", "t"),
+                    ("المستند المربوط", "t"), ("كود الطرف", "t"), ("العميل / المورد", "t"), ("وارد", "q"), ("صادر", "q"),
+                    ("الرصيد المتحرك", "q"), ("التكلفة", "m"), ("القيمة بالتكلفة", "m"), ("ملاحظات", "t")]
+            rows = [(m["date"], m["src"], m["type"], m["ref"], m["link"], m["party_code"], m["party"], m["qty_in"],
+                     m["qty_out"], m["balance"], m["cost"], m["value"], m["notes"]) for m in state["shown"]]
+            try:
+                export_report_xlsx(path, Report(f"كارت الصنف {item_code} - {item_name}", cols, rows, None,
+                                                [state["final"]], f"{state['d1']} - {d_to_e.get()}"))
+                messagebox.showinfo("نجاح", "تم تصدير كارت الصنف إلى Excel", parent=win)
+            except Exception as e:
+                handle_error(e)
+
+        rtl_row(ff, 0, [("من تاريخ:", d_from_e), ("إلى تاريخ:", d_to_e), ("المصدر:", src_cb), ("الاتجاه:", dir_cb)])
+        rtl_row(ff, 1, [("نوع الحركة:", type_cb), ("بحث (مرجع / مستند / عميل / مورد):", q_e),
+                        (None, ttk.Checkbutton(ff, text="المربوطة بمستند فقط", variable=linked_var, command=render)),
+                        (None, money_button(ff, "تطبيق 🔍", "#0284c7", load, 9))])
+        for cb in (src_cb, type_cb, dir_cb):
+            cb.bind("<<ComboboxSelected>>", render)
+        q_e.bind("<KeyRelease>", render)
+        tree.bind("<Double-1>", open_doc)
+        money_button(bottom, "🖨️ PDF", "#2563eb", export, 9).pack(side="left", padx=4)
+        money_button(bottom, "📗 Excel", "#0d9488", export_xlsx, 9).pack(side="left", padx=4)
+        money_button(bottom, "📄 فتح المستند", UI["primary"], open_doc, 9).pack(side="left", padx=4)
+        money_button(bottom, "📒 كشف حساب الطرف", "#7c3aed", open_partner, 9).pack(side="left", padx=4)
+        money_button(bottom, "🔎 حركات نفس الطرف", "#475569", same_party, 9).pack(side="left", padx=4)
+        tk.Label(bottom, text="نقر مزدوج على حركة = فتح مستندها", fg=UI["muted"], font=("Arial", 8)).pack(side="left", padx=6)
         load()
 
     # ---------------------------------------------------------- الخزينة
@@ -2468,7 +2598,7 @@ class ElhagryERP(Phase2Mixin):
         with db() as conn:
             if cat == CAT_PARTNER:
                 pairs = [(f"{c} - {n}", (c, n)) for c, n in
-                         conn.execute("SELECT partner_code, name FROM business_partners ORDER BY name")]
+                         conn.execute(f"SELECT partner_code, name FROM business_partners WHERE {ACTIVE_PARTNER_SQL} ORDER BY name")]
             elif cat == CAT_EXPENSE:
                 # حسابات المصروفات الفرعية فقط، بدون تكلفة المبيعات والمردودات والإهلاك (يحسبها النظام)
                 pairs = [(f"{c} - {n}", (c, n)) for c, n in conn.execute(
@@ -2510,6 +2640,120 @@ class ElhagryERP(Phase2Mixin):
         self.open_inv_cb.set_items(pairs)
         self.open_inv_cb.set(pairs[0][0])
         self.update_cash_rep_label()
+        self.refresh_alloc_grid()
+
+    # ---------------------------------------------------------- توزيع السند على الفواتير المفتوحة
+    def build_alloc_panel(self, frame):
+        box = ttk.LabelFrame(frame, text=" توزيع مبلغ السند على الفواتير المفتوحة للطرف (اضغط مرتين على فاتورة لتعديل المخصص) ",
+                             padding=6)
+        box.pack(fill="x", padx=10, pady=(0, 4))
+        self.alloc_box = box
+        self.alloc_map, self.alloc_rows = {}, {}
+        bar = tk.Frame(box)
+        bar.pack(fill="x")
+        money_button(bar, "⚡ توزيع تلقائي (الأقدم فالأحدث)", "#7c3aed", self.auto_allocate, 9).pack(side="right", padx=4)
+        money_button(bar, "✏️ تعديل المخصص للفاتورة المحددة", "#d97706", self.edit_alloc_selected, 9).pack(side="right", padx=4)
+        money_button(bar, "🧹 مسح التوزيع", "#64748b", self.clear_alloc, 9).pack(side="right", padx=4)
+        self.alloc_lbl = tk.Label(bar, text="", font=(UI_FONT, 10, "bold"), anchor="w", justify="left")
+        self.alloc_lbl.pack(side="left", padx=6)
+        holder = tk.Frame(box)
+        holder.pack(fill="x")
+        self.alloc_tree = make_tree(holder, [
+            ("no", "رقم الفاتورة", 120, "center"), ("date", "التاريخ", 95, "center"), ("total", "الإجمالي", 110, "center"),
+            ("paid", "المسدد سابقاً", 110, "center"), ("rem", "المتبقي", 110, "center"),
+            ("alloc", "المخصص من السند", 120, "center"), ("after", "المتبقي بعد السداد", 120, "center")],
+            height=5, expand=False)
+        self.alloc_tree.bind("<Double-1>", lambda e: self.edit_alloc_selected())
+
+    def _alloc_kind(self):
+        return "sales" if self.c_type.get().startswith("قبض") else "purchase"
+
+    def refresh_alloc_grid(self):
+        if not hasattr(self, "alloc_tree"):
+            return
+        self.alloc_map, self.alloc_rows = {}, {}
+        party = self.party_name_cb.selected()
+        if self.party_category_cb.get() == CAT_PARTNER and party and party[0]:
+            try:
+                for inv in _controls.party_open_invoices(self._alloc_kind(), party[0]):
+                    self.alloc_rows[inv["inv_id"]] = inv
+            except Exception as e:  # noqa: BLE001  (عرض فقط)
+                self.alloc_lbl.configure(text=f"تعذر تحميل الفواتير: {e}", fg="#dc2626")
+                return
+        self.render_alloc_grid()
+
+    def render_alloc_grid(self):
+        clear_tree(self.alloc_tree)
+        for iid, inv in self.alloc_rows.items():
+            a = self.alloc_map.get(iid, 0.0)
+            self.alloc_tree.insert("", "end", iid=str(iid), values=(
+                inv["no"], inv["date"], fmt(inv["total"]), fmt(inv["paid"]), fmt(inv["remaining"]),
+                fmt(a) if a > 0.005 else "-", fmt(inv["remaining"] - a)))
+        self.update_alloc_summary()
+
+    def update_alloc_summary(self):
+        if not hasattr(self, "alloc_lbl"):
+            return
+        if not self.alloc_rows:
+            party = self.party_name_cb.selected()
+            txt = ("لا توجد فواتير مفتوحة لهذا الطرف (السند سيُسجَّل دفعة تحت الحساب)." if party and party[0]
+                   and self.party_category_cb.get() == CAT_PARTNER else "اختر العميل / المورد لعرض فواتيره المفتوحة.")
+            self.alloc_lbl.configure(text=txt, fg="#475569")
+            return
+        amount = parse_float(self.c_amount.get()) or 0.0
+        used = round(sum(self.alloc_map.values()), 2)
+        open_total = round(sum(r["remaining"] for r in self.alloc_rows.values()), 2)
+        over = used > amount + 0.005
+        txt = (f"فواتير مفتوحة: {len(self.alloc_rows)} بإجمالي متبقٍ {fmt(open_total)}   |   مبلغ السند: {fmt(amount)}   |   "
+               f"الموزع: {fmt(used)}   |   " +
+               (f"⚠️ الموزع أكبر من مبلغ السند بـ {fmt(used - amount)}" if over else f"غير موزع (تحت الحساب): {fmt(amount - used)}"))
+        self.alloc_lbl.configure(text=txt, fg="#dc2626" if over else "#15803d")
+
+    def auto_allocate(self):
+        amount = parse_float(self.c_amount.get())
+        if not amount or amount <= 0:
+            messagebox.showwarning("تنبيه", "أدخل مبلغ السند أولاً ثم اضغط «توزيع تلقائي».")
+            return
+        if not self.alloc_rows:
+            messagebox.showinfo("تنبيه", "لا توجد فواتير مفتوحة لهذا الطرف.")
+            return
+        self.alloc_map = _controls.fifo_allocation(list(self.alloc_rows.values()), amount)
+        self.render_alloc_grid()
+
+    def edit_alloc_selected(self):
+        sel = self.alloc_tree.selection()
+        if not sel:
+            messagebox.showinfo("تنبيه", "اختر فاتورة من جدول التوزيع أولاً.")
+            return
+        iid = int(sel[0])
+        inv = self.alloc_rows[iid]
+        cur = self.alloc_map.get(iid, 0.0)
+        txt = simpledialog.askstring("المبلغ المخصص", f"الفاتورة {inv['no']} — المتبقي {fmt(inv['remaining'])}\n"
+                                                    "المبلغ المخصص من هذا السند (0 لإلغاء التخصيص):",
+                                     initialvalue=f"{cur:.2f}" if cur else f"{inv['remaining']:.2f}")
+        if txt is None:
+            return
+        val = parse_float(txt)
+        if val is None or val < 0:
+            messagebox.showwarning("تنبيه", "أدخل مبلغاً صحيحاً (صفر أو أكثر).")
+            return
+        if val > inv["remaining"] + 0.005:
+            messagebox.showwarning("تنبيه", f"المبلغ أكبر من متبقي الفاتورة ({fmt(inv['remaining'])}).")
+            return
+        others = sum(v for k, v in self.alloc_map.items() if k != iid)
+        amount = parse_float(self.c_amount.get()) or 0.0
+        if amount > 0 and others + val > amount + 0.005:
+            messagebox.showwarning("تنبيه", f"إجمالي الموزع ({fmt(others + val)}) سيتجاوز مبلغ السند ({fmt(amount)}).")
+            return
+        if val > 0.005:
+            self.alloc_map[iid] = round(val, 2)
+        else:
+            self.alloc_map.pop(iid, None)
+        self.render_alloc_grid()
+
+    def clear_alloc(self):
+        self.alloc_map = {}
+        self.render_alloc_grid()
 
     def update_cash_rep_label(self):
         """عرض المندوب الذي سيُورَّث للسند (من الفاتورة المختارة أو من بطاقة الطرف)."""
@@ -2877,6 +3121,10 @@ class ElhagryERP(Phase2Mixin):
                     alloc_kind = ("sales" if r[7] in ("sales", "مبيعات") else
                                   "purchase" if r[7] in ("purchase", "مشتريات") else None)
                     alloc = f"فاتورة {invoice_number(alloc_kind, r[8])}" if alloc_kind else f"{r[7]} #{r[8]}"
+                else:
+                    parts = _controls.voucher_allocations(r[0])
+                    if parts:
+                        alloc = "، ".join(f"فاتورة {no}: {fmt(a)}" for _, _, no, a in parts)
                 header = [("رقم السند", r[0]), ("النوع", f"سند {r[1]}"), ("التاريخ", r[2]), ("الخزينة / البنك", r[3]),
                           ("الطرف", f"{r[4] or '-'} - {r[5]}"), ("مخصص لـ", alloc), ("البيان", r[9] or "-")]
                 totals = [("المبلغ", r[6])]
@@ -2953,7 +3201,8 @@ class ElhagryERP(Phase2Mixin):
 
     def update_statement_partners_dropdown(self):
         with db() as conn:
-            rows = conn.execute("SELECT partner_code, name, is_customer, is_supplier FROM business_partners ORDER BY name").fetchall()
+            rows = conn.execute("SELECT partner_code, name, is_customer, is_supplier FROM business_partners "
+                                f"WHERE {ACTIVE_PARTNER_SQL} ORDER BY name").fetchall()
         cust_ok, supp_ok = self.can_fin("customer"), self.can_fin("supplier")
         pairs = [(f"{c} - {n}", c) for c, n, is_c, is_s in rows
                  if (is_c and cust_ok) or (is_s and supp_ok) or (not is_c and not is_s)]
@@ -3078,8 +3327,16 @@ class ElhagryERP(Phase2Mixin):
         pf = ttk.LabelFrame(frame, text=" الأمان ", padding=10)
         pf.pack(fill="x", padx=10, pady=5)
         self.admin_pwd_e = ttk.Entry(pf, width=24, show="*")
-        rtl_row(pf, 0, [("كلمة مرور المدير (لفتح الأيام المغلقة):", self.admin_pwd_e)], slots=1)
+        rtl_row(pf, 0, [("كلمة مرور المدير الجديدة (فتح الأيام المغلقة وتجاوز الحد الائتماني):", self.admin_pwd_e)],
+                slots=1)
         money_button(pf, "حفظ كلمة المرور", "#16a34a", self.save_admin_password, 9).grid(row=1, column=0, columnspan=2, pady=6)
+        if self.user["is_admin"]:
+            self.reset_pwd_e = ttk.Entry(pf, width=24, show="*")
+            rtl_row(pf, 2, [("كلمة مرور تصفير الحركات الجديدة:", self.reset_pwd_e)], slots=1)
+            money_button(pf, "حفظ كلمة مرور التصفير", "#dc2626", self.save_reset_password, 9).grid(
+                row=3, column=0, columnspan=2, pady=6)
+        self.secret_state_lbl = tk.Label(pf, text="", fg=UI["muted"], font=(UI_FONT, 9), justify="right")
+        self.secret_state_lbl.grid(row=4, column=0, columnspan=2, sticky="e")
         if self.user["is_admin"]:
             sf = ttk.LabelFrame(frame, text=" الترقيم التسلسلي المستقل (للمدير) ", padding=10)
             sf.pack(fill="x", padx=10, pady=5)
@@ -3167,9 +3424,14 @@ class ElhagryERP(Phase2Mixin):
             e.insert(0, info.get(key) or "")
         if hasattr(self, "seq_entries"):
             self.load_sequences_form()
-        if hasattr(self, "admin_pwd_e"):
-            self.admin_pwd_e.delete(0, tk.END)
-            self.admin_pwd_e.insert(0, get_setting("admin_password", "2026"))
+        # كلمات المرور مشفرة ولا تُعرض أبداً: الحقول فارغة لإدخال كلمة جديدة، والحالة فقط تظهر
+        for name in ("admin_pwd_e", "reset_pwd_e"):
+            if hasattr(self, name):
+                getattr(self, name).delete(0, tk.END)
+        if hasattr(self, "secret_state_lbl"):
+            st_ = ["كلمة مرور المدير: " + ("✅ مضبوطة (مشفرة)" if _engine.secret_is_set("admin_password") else "⚠️ غير مضبوطة"),
+                   "كلمة مرور التصفير: " + ("✅ مضبوطة (مشفرة)" if _engine.reset_password_is_set() else "⚠️ غير مضبوطة")]
+            self.secret_state_lbl.config(text="   •   ".join(st_))
 
     def load_sequences_form(self):
         with db() as conn:
@@ -3487,6 +3749,351 @@ class ElhagryERP(Phase2Mixin):
         nb.select(tabs["items"])
         for k in self.IMPORT_ORDER:
             self._build_import_kind(tabs[k], k)
+        hw = ttk.Frame(nb)
+        nb.add(hw, text="  🔄 استيراد HansaWorld (ترحيل كامل)  ")   # أقصى اليمين (أول تبويب بالقراءة العربية)
+        self._build_hansa_tab(hw)
+
+    # ---------------------------------------------------------- استيراد HansaWorld
+    HW_FILES = (("customers", "1) العملاء — «تفاصيل العملاء.xlsx» (شيت ورقة1)"),
+                ("suppliers", "2) الموردون — «حركات الموردين بالتفصيل ....xlsx» (شيت Supplier Transactions)"),
+                ("history", "3) حركات الأصناف — «حركات الاصناف بالتفصيل ....xlsx» (شيت Item History)"),
+                ("costs", "4) التكلفة والرصيد — «تكلفه الخامات التي لها رصيد ....xlsx» (شيت Item Cost Price Analysis)"),
+                ("balance", "5) ميزان المراجعة التحليلي — «Balance sheet.xlsx» (شيت Analytical Balance Report)"))
+
+    def _build_hansa_tab(self, parent):
+        self.hw = {"paths": {}, "res": None}
+        card = ttk.LabelFrame(parent, text=" ملفات HansaWorld (اختر ما تريد؛ يمكن الاستيراد على مراحل) ", padding=10)
+        card.pack(fill="x", padx=8, pady=6)
+        tk.Label(card, text="يُفضّل تنفيذ «تصفير الحركات» أولاً (يحتفظ بالشركاء والأصناف). الشركاء يأخذون أكواد HansaWorld: "
+                            "العميل C0001 والمورد كيان منفصل S0001. الفواتير والسندات بتواريخها وأرقامها الأصلية، والسندات "
+                            "موزعة على الفواتير حسب Applied To. إعادة الاستيراد لا تكرر أي مستند.",
+                 wraplength=1080, justify="right", anchor="e", fg=UI["muted"], font=(UI_FONT, 9)).pack(fill="x")
+        grid = tk.Frame(card)
+        grid.pack(fill="x", pady=4)
+        self.hw["labels"] = {}
+        for i, (key, title) in enumerate(self.HW_FILES):
+            tk.Label(grid, text=title, anchor="e", font=(UI_FONT, 9, "bold")).grid(row=i, column=2, sticky="e", padx=6, pady=2)
+            money_button(grid, "📂 اختيار", UI["primary"], lambda k=key: self._hw_pick(k), 9).grid(row=i, column=1, padx=4)
+            lbl = tk.Label(grid, text="لم يُختر", fg=UI["muted"], anchor="w", width=60)
+            lbl.grid(row=i, column=0, sticky="w")
+            self.hw["labels"][key] = lbl
+        opts = tk.Frame(card)
+        opts.pack(fill="x", pady=4)
+        tk.Label(opts, text="حساب الخزينة/البنك للسندات التاريخية:").pack(side="right", padx=4)
+        with db() as conn:
+            names = [_hansa.HW_CASH_ACCOUNT] + [n for n in cash_account_names(conn) if n != _hansa.HW_CASH_ACCOUNT]
+        self.hw["acct"] = ttk.Combobox(opts, values=names, width=32, state="readonly")
+        self.hw["acct"].set(names[0])
+        self.hw["acct"].pack(side="right")
+        self.hw["cash_open"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="اعتماد أرصدة الصناديق والبنوك من الميزان كأرصدة افتتاحية بتاريخ:",
+                        variable=self.hw["cash_open"]).pack(side="right", padx=(18, 4))
+        self.hw["asof"] = date_entry(opts, 12, "2026-11-19")
+        self.hw["asof"].pack(side="right")
+        bar = tk.Frame(card)
+        bar.pack(fill="x", pady=4)
+        money_button(bar, "🔍 معاينة ومطابقة (بدون حفظ)", UI["primary"], lambda: self._hw_run(True), 10).pack(side="right", padx=4)
+        money_button(bar, "✅ تنفيذ الاستيراد والحفظ", UI["teal"], lambda: self._hw_run(False), 10).pack(side="right", padx=4)
+        money_button(bar, "📗 تصدير تقرير المطابقة Excel", "#0d9488", self._hw_export, 9).pack(side="left", padx=4)
+        res = ttk.LabelFrame(parent, text=" النتيجة وتقرير المطابقة مع HansaWorld ", padding=8)
+        res.pack(fill="both", expand=True, padx=8, pady=4)
+        self.hw["stats"] = tk.Label(res, text=_hansa.last_import_summary() or "", font=(UI_FONT, 10, "bold"),
+                                    fg=UI["primary_dk"], anchor="e", justify="right", wraplength=1080)
+        self.hw["stats"].pack(fill="x")
+        holder = tk.Frame(res)
+        holder.pack(fill="both", expand=True)
+        self.hw["tree"] = make_tree(holder, [("c0", "القسم", 90, "center"), ("c1", "البند", 330, "e"),
+                                             ("c2", "HansaWorld", 140, "center"), ("c3", "النظام", 140, "center"),
+                                             ("c4", "الفرق", 110, "center"), ("c5", "الحالة", 90, "center")], height=10, rtl=True)
+        self.hw["tree"].tag_configure("bad", foreground="#dc2626")
+        tk.Label(res, text="ملاحظات وتنبيهات الاستيراد:", anchor="e", font=(UI_FONT, 9, "bold")).pack(fill="x")
+        self.hw["probs"] = tk.Text(res, height=6, wrap="word", font=(UI_FONT, 9), fg="#b45309")
+        self.hw["probs"].pack(fill="x")
+        exp = ttk.LabelFrame(parent, text=" حركات المصاريف التفصيلية (عند تصديرها لاحقاً) — تُقارن بأرصدة الميزان المرجعية ",
+                             padding=8)
+        exp.pack(fill="x", padx=8, pady=(0, 4), before=res)   # فوق النتائج حتى لا تدفعه خارج الشاشة
+        tk.Label(exp, text="الأعمدة: " + " ، ".join(_hansa.EXP_TEMPLATE) + "  (تُقبل أيضاً Date / Account / Debit / Text / "
+                           "Doc No). كل سطر = سند صرف على حساب المصروف، وإعادة الاستيراد لا تكرر السطور.",
+                 wraplength=1080, justify="right", anchor="e", fg=UI["muted"], font=(UI_FONT, 9)).pack(fill="x")
+        eb = tk.Frame(exp)
+        eb.pack(fill="x", pady=4)
+        money_button(eb, "⬇️ نموذج Excel", "#475569", self._hw_exp_template, 9).pack(side="right", padx=3)
+        money_button(eb, "📂 اختيار ملف ومعاينة", UI["primary"], lambda: self._hw_exp_run(True), 9).pack(side="right", padx=3)
+        money_button(eb, "✅ تنفيذ استيراد المصاريف", UI["teal"], lambda: self._hw_exp_run(False), 9).pack(side="right", padx=3)
+        self.hw["exp_lbl"] = tk.Label(eb, text="", fg=UI["muted"])
+        self.hw["exp_lbl"].pack(side="right", padx=8)
+        agg = ttk.LabelFrame(parent, text=" 📥 ترحيل أرصدة المصاريف المرجعية من الميزان: 43xxx البيعية والتسويقية • "
+                                          "5xxxx الإدارية والعمومية • 41125 إيجار السيارات ", padding=8)
+        agg.pack(fill="x", padx=8, pady=(0, 4), before=exp)
+        self.hw["agg_status"] = tk.Label(agg, text="", anchor="e", justify="right", wraplength=1080,
+                                         font=(UI_FONT, 9, "bold"), fg=UI["primary_dk"])
+        self.hw["agg_status"].pack(fill="x")
+        ab = tk.Frame(agg)
+        ab.pack(fill="x", pady=(4, 0))
+        money_button(ab, "📥 ترحيل أرصدة المصاريف المرجعية (تجميع فترة)", "#7c3aed", self._hw_post_aggregate, 10
+                     ).pack(side="right", padx=3)
+        money_button(ab, "↩️ إلغاء قيد التجميع", "#64748b", self._hw_remove_aggregate, 9).pack(side="right", padx=3)
+        tk.Label(ab, text="الحساب المقابل:").pack(side="right", padx=(12, 2))
+        self.hw["agg_counter"] = ttk.Entry(ab, width=10)
+        self.hw["agg_counter"].insert(0, _engine.OPENING_ACCOUNT)
+        self.hw["agg_counter"].pack(side="right")
+        tk.Label(ab, text="قيد نظام لكل فترة مرجعية يُرحِّل الفرق فقط (المرجع − الحركات التفصيلية)، ويُعاد بناؤه "
+                          "تلقائياً عند استيراد حركات تفصيلية أو قائمة دخل.", fg=UI["muted"], font=(UI_FONT, 8)
+                 ).pack(side="right", padx=8)
+        pb = tk.Frame(agg)
+        pb.pack(fill="x", pady=(4, 0))
+        money_button(pb, "📄 استيراد قائمة دخل HansaWorld لفترة (Profit & Loss)", "#0369a1", self._hw_import_pl, 9
+                     ).pack(side="right", padx=3)
+        money_button(pb, "⚖️ مطابقة قائمة الدخل مع HansaWorld", "#15803d", self._hw_show_pl_compare, 9
+                     ).pack(side="right", padx=3)
+        money_button(pb, "🗑️ حذف قائمة دخل مرجعية", "#64748b", self._hw_remove_pl, 9).pack(side="right", padx=3)
+        tk.Label(pb, text="القائمة (Excel/CSV أو نص منسوخ من PDF) تقسم فترة الميزان: فتظهر تكلفة ومصروفات كل سنة في سنتها "
+                          "وتُسوّى تكلفة المبيعات لدفتر HansaWorld.", fg=UI["muted"], font=(UI_FONT, 8)).pack(side="right", padx=8)
+        self._hw_agg_refresh()
+
+    def _hw_agg_refresh(self):
+        """سطر حالة واضح: الأرصدة المرجعية لكل مجموعة، وهل رُحّل قيد التجميع أم لا."""
+        lbl = self.hw.get("agg_status") if getattr(self, "hw", None) else None
+        if lbl is None:
+            return
+        try:
+            st = _hansa.tb_expense_status()
+        except Exception as e:  # noqa: BLE001
+            lbl.config(text=f"تعذر قراءة الأرصدة المرجعية: {e}", fg="#dc2626")
+            return
+        if not st["total"] and not any(g[1] for g in st["groups"]):
+            lbl.config(text="⚠️ لا توجد أرصدة مصاريف مرجعية بعد: استورد «ميزان المراجعة التحليلي» (الملف 5) أولاً، "
+                            "ثم اضغط «ترحيل أرصدة المصاريف المرجعية».", fg="#b45309")
+            return
+        parts = "  •  ".join(f"{g[0]}: {fmt(g[2])} ({g[1]} حساب)" for g in st["groups"])
+        if abs(st.get("other_income", 0.0)) > 0.005:
+            parts += f"  •  {_hansa.TB_OTHER_REV_LABEL}: {fmt(st['other_income'])}"
+        if st["posted"]:
+            eid, d, amt = st["posted"]
+            state = f"✅ مُرحَّل: قيود نظام رقم {eid} بتاريخ {d} بمبلغ {fmt(amt)} ر.س (يظهر في قائمة الدخل ولوحة المؤشرات)"
+            color = "#15803d"
+        else:
+            state = "⏳ غير مُرحَّل بعد — المصاريف لا تظهر في قائمة الدخل ولوحة المؤشرات حتى تضغط «ترحيل»"
+            color = "#b45309"
+        segs = st.get("segments") or []
+        seg_txt = "  |  ".join(f"{a} → {b} ({_hansa.PL_SRC_LABELS.get(src, src)}): مبيعات {fmt(t['sales'])} • تكلفة "
+                               f"{fmt(t['cogs'])} • مصروفات {fmt(t['opex'])} • صافي {fmt(t['net_profit'])}"
+                               for a, b, src, t in segs)
+        lbl.config(text=f"الأرصدة المرجعية حتى {st['as_of'] or '-'}: {parts}  •  الإجمالي {fmt(st['total'])} ر.س\n{state}"
+                        + (f"\nالفترات المرجعية: {seg_txt}" if seg_txt else ""), fg=color)
+
+    def _hw_import_pl(self):
+        path = filedialog.askopenfilename(title="قائمة دخل HansaWorld (Profit & Loss)",
+                                          filetypes=[("Excel / CSV / نص", "*.xlsx *.xls *.csv *.txt")])
+        if not path:
+            return
+        try:
+            prev = _hansa.import_pl_reference(path, dry_run=True)
+        except UserError:
+            a = simpledialog.askstring("فترة القائمة", "لم أجد الفترة في الملف. اكتب: من إلى (YYYY-MM-DD YYYY-MM-DD)",
+                                       parent=self.root)
+            if not a or len(a.split()) != 2:
+                return
+            try:
+                prev = _hansa.import_pl_reference(path, *a.split(), dry_run=True)
+            except Exception as e:
+                handle_error(e)
+                return
+        except Exception as e:
+            handle_error(e)
+            return
+        f, t = prev["period"]
+        tt = prev["totals"]
+        self._hw_show_report(prev["report"], f"🔍 معاينة قائمة دخل HansaWorld {f} → {t}: {prev['accounts']} حساب")
+        if not messagebox.askyesno(
+                "تأكيد", f"اعتماد قائمة دخل HansaWorld للفترة {f} → {t} مرجعاً؟\n\n"
+                         f"المبيعات {fmt(tt['sales'])}\nتكلفة المبيعات {fmt(tt['cogs'])}\nمجمل الربح {fmt(tt['gross'])}\n"
+                         f"المصروفات {fmt(tt['opex'])}\nصافي الربح {fmt(tt['net_profit'])}\n\n"
+                         "ستُعاد بناء تسوية تكلفة المبيعات وقيود تجميع المصاريف لكل فترة (تُحفظ نسخة احتياطية أولاً)."
+                         + ("\n\n⚠️ " + "\n".join(prev["problems"]) if prev["problems"] else "")):
+            return
+        try:
+            out = _hansa.import_pl_reference(path, f, t)
+        except Exception as e:
+            handle_error(e)
+            return
+        self._hw_show_report(out["report"], f"✅ اعتُمدت قائمة دخل HansaWorld {f} → {t} — مطابقة قائمة الدخل:")
+        self._hw_agg_refresh()
+        try:
+            self.refresh_all()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _hw_show_pl_compare(self):
+        try:
+            rep_ = _hansa.rep_hw_pl_compare({})
+        except Exception as e:
+            handle_error(e)
+            return
+        self._hw_show_report(rep_, "⚖️ مطابقة قائمة الدخل بالنظام مع HansaWorld لكل فترة مرجعية:")
+        self.hw["res"] = dict(report=rep_, details={})
+
+    def _hw_remove_pl(self):
+        refs = _hansa.list_pl_references()
+        if not refs:
+            messagebox.showinfo("تنبيه", "لا توجد قوائم دخل مرجعية مستوردة.")
+            return
+        a, b = refs[-1][0], refs[-1][1]
+        if not messagebox.askyesno("تأكيد", f"حذف قائمة دخل HansaWorld المرجعية {a} → {b}؟\n"
+                                            "تُعاد بناء التسويات والقيود على الميزان وحده."):
+            return
+        try:
+            _hansa.remove_pl_reference(a, b)
+        except Exception as e:
+            handle_error(e)
+            return
+        self._hw_agg_refresh()
+        messagebox.showinfo("تم", "تم حذف قائمة الدخل المرجعية.")
+
+    def _hw_show_report(self, rep_, head):
+        tree = self.hw["tree"]
+        clear_tree(tree)
+        for r in rep_.rows + ([rep_.total] if rep_.total else []):
+            r = list(r) + [""] * (6 - len(r))
+            vals = [r[0], r[1]] + ["" if v is None else (fmt(v) if isinstance(v, float) else v) for v in r[2:5]] + [r[5]]
+            tree.insert("", "end", values=vals, tags=("bad",) if str(r[5]).startswith("❌") else ())
+        self.hw["stats"].configure(text=head)
+        self.hw["probs"].delete("1.0", tk.END)
+        self.hw["probs"].insert("1.0", "\n".join(rep_.notes))
+
+    def _hw_post_aggregate(self):
+        counter = self.hw["agg_counter"].get().strip() or _engine.OPENING_ACCOUNT
+        asof = parse_date(self.hw["asof"].get()) or None
+        try:
+            prev = _hansa.post_tb_expense_aggregate(counter=counter, as_of=asof, dry_run=True)
+        except Exception as e:
+            handle_error(e)
+            return
+        self._hw_show_aggregate(prev, True)
+        if not messagebox.askyesno("تأكيد الترحيل", f"ترحيل {fmt(prev['total'])} ر.س إلى حسابات المصروفات بقيد نظام "
+                                                   f"بتاريخ {prev['as_of']} مقابل ح/ {prev['counter']}؟\n"
+                                                   "(إعادة الترحيل تستبدل القيد ولا تكرره — تُحفظ نسخة احتياطية أولاً)"):
+            return
+        try:
+            out = _hansa.post_tb_expense_aggregate(counter=counter, as_of=asof)
+        except Exception as e:
+            handle_error(e)
+            return
+        self._hw_show_aggregate(out, False)
+        self._hw_agg_refresh()
+        messagebox.showinfo("تم", f"تم ترحيل أرصدة المصاريف (قيد رقم {out['entry_id']}).")
+
+    def _hw_remove_aggregate(self):
+        if not messagebox.askyesno("تأكيد", "إلغاء قيد «تجميع فترة من ميزان HansaWorld» للمصاريف؟"):
+            return
+        try:
+            out = _hansa.post_tb_expense_aggregate(remove=True)
+        except Exception as e:
+            handle_error(e)
+            return
+        self._hw_agg_refresh()
+        messagebox.showinfo("تم", "تم إلغاء قيد التجميع." if out["removed"] else "لا يوجد قيد تجميع مسجل.")
+
+    def _hw_show_aggregate(self, out, dry):
+        rep_ = out["report"]
+        tree = self.hw["tree"]
+        clear_tree(tree)
+        for r in rep_.rows + [rep_.total]:
+            tree.insert("", "end", values=[r[0], r[1]] + [fmt(v) for v in r[2:5]] + [r[5]])
+        self.hw["stats"].configure(text=("🔍 معاينة — لم يُحفظ شيء.  " if dry else "✅ تم الترحيل.  ") +
+                                   f"{rep_.title}: {fmt(out['total'])} ر.س")
+        self.hw["probs"].delete("1.0", tk.END)
+        self.hw["probs"].insert("1.0", "\n".join(rep_.notes))
+
+    def _hw_show(self, out, dry):
+        tree = self.hw["tree"]
+        clear_tree(tree)
+        for r in out["report"].rows:
+            vals = [r[0], r[1]] + ["" if v is None else (fmt(v) if isinstance(v, float) else v) for v in r[2:5]] + [r[5]]
+            tree.insert("", "end", values=vals, tags=("bad",) if str(r[5]).startswith("❌") else ())
+        head = ("🔍 معاينة فقط — لم يُحفظ شيء.  " if dry else "✅ تم الحفظ.  ") + out["report"].notes[-1]
+        self.hw["stats"].configure(text=head + "\n" + _hansa.stats_text(out["stats"]))
+        self.hw["probs"].delete("1.0", tk.END)
+        self.hw["probs"].insert("1.0", "\n".join(out["problems"]) or "لا توجد تنبيهات.")
+        self.hw["res"] = out
+
+    def _hw_exp_template(self):
+        path = filedialog.asksaveasfilename(defaultextension=".xlsx", initialfile="نموذج حركات المصاريف.xlsx",
+                                            filetypes=[("Excel", "*.xlsx")])
+        if path:
+            _hansa.write_expense_template(path)
+            messagebox.showinfo("نجاح", f"تم حفظ النموذج:\n{path}")
+
+    def _hw_exp_run(self, dry):
+        if dry or not self.hw.get("exp_path"):
+            path = filedialog.askopenfilename(title="ملف حركات المصاريف", filetypes=[("Excel / CSV", "*.xlsx *.xls *.csv")])
+            if not path:
+                return
+            self.hw["exp_path"] = path
+            self.hw["exp_lbl"].configure(text=f"📄 {os.path.basename(path)}")
+        if not dry and not messagebox.askyesno("تأكيد", "تسجيل حركات المصاريف كسندات صرف؟ (تُحفظ نسخة احتياطية أولاً)"):
+            return
+        try:
+            out = _hansa.import_expense_movements(self.hw["exp_path"], cash_account=self.hw["acct"].get(), dry_run=dry)
+        except Exception as e:
+            handle_error(e)
+            return
+        self._hw_show(out, dry)
+        if not dry:
+            self._hw_agg_refresh()
+
+    def _hw_pick(self, key):
+        path = filedialog.askopenfilename(title="اختر ملف HansaWorld", filetypes=[("Excel", "*.xlsx *.xls"), ("كل الملفات", "*.*")])
+        if path:
+            self.hw["paths"][key] = path
+            self.hw["labels"][key].configure(text=f"📄 {os.path.basename(path)}", fg="#15803d")
+
+    def _hw_run(self, dry):
+        files = {k: v for k, v in self.hw["paths"].items() if v}
+        if not files:
+            messagebox.showinfo("تنبيه", "اختر ملفاً واحداً على الأقل.")
+            return
+        if not dry and not messagebox.askyesno(
+                "تأكيد الاستيراد", "سيتم ترحيل بيانات HansaWorld المختارة إلى قاعدة البيانات (تُحفظ نسخة احتياطية أولاً).\n"
+                                   "الشركاء سيأخذون أكواد HansaWorld. هل تريد المتابعة؟", icon="warning"):
+            return
+        self.root.config(cursor="watch")
+        self.hw["stats"].configure(text="⏳ جاري المعالجة... (قد يستغرق دقيقة)")
+        self.root.update_idletasks()
+        try:
+            asof = parse_date(self.hw["asof"].get())
+            if self.hw["cash_open"].get() and not asof:
+                raise UserError("تاريخ الأرصدة الافتتاحية للخزينة غير صحيح (YYYY-MM-DD).")
+            out = _hansa.run_hansa_import(**files, cash_account=self.hw["acct"].get(), dry_run=dry, tb_as_of=asof,
+                                          apply_cash_openings=self.hw["cash_open"].get())
+        except Exception as e:
+            self.hw["stats"].configure(text="")
+            handle_error(e)
+            return
+        finally:
+            self.root.config(cursor="")
+        self._hw_show(out, dry)
+        if not dry:
+            self._hw_agg_refresh()
+            try:
+                self.refresh_all()
+            except Exception:  # noqa: BLE001
+                pass
+            messagebox.showinfo("تم", "تم استيراد بيانات HansaWorld. راجع تقرير المطابقة وصدّره إلى Excel للتفاصيل.")
+
+    def _hw_export(self):
+        out = self.hw.get("res")
+        if not out:
+            messagebox.showinfo("تنبيه", "نفّذ المعاينة أو الاستيراد أولاً.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".xlsx", initialfile="مطابقة HansaWorld.xlsx",
+                                            filetypes=[("Excel", "*.xlsx")])
+        if path:
+            try:
+                _hansa.export_reconciliation_xlsx(path, out["report"], out["details"])
+                messagebox.showinfo("نجاح", f"تم حفظ تقرير المطابقة:\n{path}")
+            except Exception as e:
+                handle_error(e)
 
     def _build_import_kind(self, parent, kind):
         spec = IMPORT_KINDS[kind]
@@ -4086,7 +4693,7 @@ class ElhagryERP(Phase2Mixin):
         st["tree"] = make_tree(box, [
             ("code", "الكود", 80, "center"), ("name", "الاسم", 250, "e"), ("phone", "الهاتف", 110, "center"),
             ("vat", "الرقم الضريبي", 125, "center"), ("rep", "المندوب", 110, "center"), ("opening", "الرصيد الافتتاحي", 130, "center"),
-            ("linked", "مرتبط بـ", 110, "center"), ("legacy", "الكود القديم", 90, "center")])
+            ("linked", "مرتبط بـ", 110, "center")])
         st["tree"].bind("<Double-1>", lambda e, r=role: self._pp_edit(r))
         self._pp_clear(role)
 
@@ -4215,10 +4822,10 @@ class ElhagryERP(Phase2Mixin):
             return
         clear_tree(st["tree"])
         fin = self.can_fin(role)
-        for code, name, phone, vat, rep, ob, legacy, *_rest, links in list_partners(role, st["search"].get().strip()):
+        for code, name, phone, vat, rep, ob, _legacy, *_rest, links in list_partners(role, st["search"].get().strip()):
             opening = "-" if abs(ob) < 0.005 else f"{abs(ob):,.2f} {'مدين' if ob > 0 else 'دائن'}"
             st["tree"].insert("", "end", iid=code, values=(code, name, phone or "-", vat or "-", rep or "-",
-                                                           opening if fin else "🔒", links or "-", legacy or "-"))
+                                                           opening if fin else "🔒", links or "-"))
 
     def load_entities(self):
         for role in ("customer", "supplier"):
@@ -4519,7 +5126,7 @@ class ElhagryERP(Phase2Mixin):
                   ("سعر البيع", fmt(d["price"]) if d["price"] else "-"),
                   ("هامش الربح", f"{d['margin']:.1f}%" if d["margin"] is not None else "-"),
                   ("آخر تكلفة شراء", fmt(d["last_cost"]) if d["last_cost"] is not None else "-"),
-                  ("الباركود", d["barcode"] or "-"), ("الكود القديم", d["legacy"] or "-"),
+                  ("الباركود", d["barcode"] or "-"),
                   ("إجمالي المبيعات (كمية)", f"{d['sold_qty']:,.3f}"), ("إجمالي المشتريات (كمية)", f"{d['bought_qty']:,.3f}")]
         for i, (lab, val) in enumerate(fields):
             r_, c_ = divmod(i, 4)
@@ -4600,7 +5207,7 @@ class ElhagryERP(Phase2Mixin):
                 prev_lbl.configure(image="", text="لا توجد مرفقات بعد\n\nاضغط «➕ رفع ملفات»")
                 prev_lbl.image = None
             # تحديث عدد المرفقات في سجل الفواتير/القيود
-            for fn in (("load_purchase_invoices",) if doc_type == "purchase" else ()):
+            for fn in {"purchase": ("load_purchase_invoices",), "voucher": ("load_cash_transactions",)}.get(doc_type, ()):
                 try:
                     getattr(self, fn)()
                 except Exception:
@@ -4706,7 +5313,7 @@ class ElhagryERP(Phase2Mixin):
             return
         if period_is_closed(d):
             pwd = simpledialog.askstring("تأكيد إداري", f"تاريخ ({d}) تم إغلاقه!\nأدخل كلمة مرور المدير للمتابعة:", show="*")
-            if pwd != get_setting("admin_password", "2026"):
+            if pwd is None or not _engine.verify_modify_password(pwd):
                 raise UserError("كلمة المرور غير صحيحة. تم إلغاء العملية.")
 
     def setup_sales_tab(self, frame):
@@ -5716,12 +6323,21 @@ class ElhagryERP(Phase2Mixin):
     # الأمان
     # ============================================================
     def save_admin_password(self):
-        pwd = self.admin_pwd_e.get().strip()
-        if len(pwd) < 4:
-            messagebox.showwarning("تنبيه", "كلمة المرور 4 أحرف على الأقل.")
+        try:
+            _engine.set_modify_password(self.admin_pwd_e.get())
+        except Exception as e:
+            handle_error(e)
             return
-        set_setting("admin_password", pwd)
-        messagebox.showinfo("نجاح", "تم حفظ كلمة مرور المدير.")
+        self.admin_pwd_e.delete(0, tk.END)
+        messagebox.showinfo("نجاح", "تم حفظ كلمة مرور المدير (مشفرة).")
+
+    def save_reset_password(self):
+        try:
+            _engine.set_reset_password(self.reset_pwd_e.get())
+            self.reset_pwd_e.delete(0, tk.END)
+            messagebox.showinfo("نجاح", "تم حفظ كلمة مرور تصفير الحركات (مشفرة).")
+        except Exception as e:
+            handle_error(e)
 
     # ============================================================
     # الصلاحية والأصناف الراكدة
@@ -5812,13 +6428,17 @@ class ElhagryERP(Phase2Mixin):
                                 ("best_supp", "#0d9488", "⭐"), ("stock", "#6366f1", "🏭")]),
         ("g_cash", "#0d9488", [("cash_box", "#0d9488", "💵"), ("banks", "#2563eb", "🏦"),
                                ("cash_total", "#0891b2", "💰"), ("net_position", "#16a34a", "⚖️")]),
-        ("g_exp", "#dc2626", [("expenses", "#dc2626", "💸"), ("depreciation", "#ea580c", "📉"),
-                              ("gross", "#0284c7", "📊"), ("profit", "#16a34a", "📈")]),
+        # بترتيب قائمة الدخل: مجمل الربح ← المصروفات التشغيلية ← الإهلاك ← صافي الربح
+        ("g_exp", "#dc2626", [("gross", "#0284c7", "📊"), ("expenses", "#dc2626", "💸"),
+                              ("depreciation", "#ea580c", "📉"), ("profit", "#16a34a", "📈")]),
     ]
     DASH_CHARTS = ["flow", "cash", "exp", "expiry"]
     DASH_TEXT = {
         "ar": dict(
-            title="لوحة المؤشرات والأداء العام", subtitle="من الفواتير والسندات والقيود الفعلية • المبالغ قبل الضريبة",
+            title="لوحة المؤشرات والأداء العام",
+            subtitle="تراكمي من بداية العمل حتى اليوم • من الفواتير والسندات والقيود الفعلية • المبالغ قبل الضريبة",
+            formula="مجمل الربح = صافي المبيعات {} − تكلفة المبيعات {}   •   صافي الربح = مجمل الربح {} + إيرادات أخرى {} "
+                    "− المصروفات التشغيلية {} − الإهلاك {} = {}   (مطابق لقائمة الدخل من بداية العمل حتى اليوم)",
             refresh="🔄 تحديث الآن", auto="تحديث تلقائي كل 30 ثانية", updated="آخر تحديث: {}",
             dark="🌙 الوضع الداكن", light="☀️ الوضع الفاتح", lang="English", cur="ر.س",
             g_sales="المبيعات والعملاء", g_purch="المشتريات والمخزون", g_cash="الخزينة والبنوك والنقدية",
@@ -5837,9 +6457,14 @@ class ElhagryERP(Phase2Mixin):
             x_stag="راكدة (بلا حركة +{} يوماً)", x_clear="✓ لا توجد أصناف منتهية أو راكدة",
             a_warn="⚠️ تنبيه", a_expired="دفعات منتهية الصلاحية: {} ({} ر.س)",
             a_near="تنتهي خلال {} يوماً: {} دفعة ({} ر.س)", a_stag="أصناف راكدة بلا حركة أكثر من {} يوماً: {}",
-            a_more="(اضغط للتفاصيل)", a_ok="✓ لا توجد أصناف منتهية أو قريبة الانتهاء أو راكدة"),
+            a_more="(اضغط للتفاصيل)", a_ok="✓ لا توجد أصناف منتهية أو قريبة الانتهاء أو راكدة",
+            sources="ℹ️ مصادر الأرقام والمطابقة",
+            breakdown="المصروفات التشغيلية = بيعية وتسويقية (43) {} + إدارية وعمومية (5) {} + أخرى (41125 إيجار سيارات…) {}"),
         "en": dict(
-            title="Performance Dashboard", subtitle="From actual invoices, vouchers and journals • Amounts before VAT",
+            title="Performance Dashboard",
+            subtitle="Cumulative to date • From actual invoices, vouchers and journals • Amounts before VAT",
+            formula="Gross profit = Net sales {} − COGS {}   •   Net profit = Gross {} + Other income {} − OpEx {} "
+                    "− Depreciation {} = {}   (matches the income statement, inception to date)",
             refresh="🔄 Refresh", auto="Auto-refresh every 30 s", updated="Updated: {}",
             dark="🌙 Dark mode", light="☀️ Light mode", lang="العربية", cur="SAR",
             g_sales="Sales & Customers", g_purch="Purchases & Inventory", g_cash="Treasury, Banks & Cash",
@@ -5858,7 +6483,9 @@ class ElhagryERP(Phase2Mixin):
             x_stag="Stagnant (no movement > {} days)", x_clear="✓ No expired or stagnant items",
             a_warn="⚠️ Alert", a_expired="Expired batches: {} ({} SAR)",
             a_near="Expiring within {} days: {} batches ({} SAR)", a_stag="Stagnant items (no movement > {} days): {}",
-            a_more="(click for details)", a_ok="✓ No expired, near-expiry or stagnant items"),
+            a_more="(click for details)", a_ok="✓ No expired, near-expiry or stagnant items",
+            sources="ℹ️ Number sources & reconciliation",
+            breakdown="OpEx = Selling (43) {} + Administrative (5) {} + Other (41125 car rent…) {}"),
     }
     DASH_THEMES = {
         "light": dict(bg="#f1f5f9", card="#ffffff", border="#e2e8f0", ink="#0f172a", text="#64748b", label="#334155",
@@ -5965,6 +6592,7 @@ class ElhagryERP(Phase2Mixin):
         tbtn(self._dt("light") if self.dash_theme == "dark" else self._dt("dark"),
              self.toggle_dashboard_theme).pack(side=L, padx=(8, 0))
         tbtn("🌐 " + self._dt("lang"), self.toggle_dashboard_lang).pack(side=L, padx=(8, 0))
+        tbtn(self._dt("sources"), self.open_dashboard_sources).pack(side=L, padx=(8, 0))
         tk.Checkbutton(top, text=self._dt("auto"), variable=self.dash_auto_var, bg=P["bg"], fg=P["label"],
                        activebackground=P["bg"], activeforeground=P["ink"], selectcolor=P["card"],
                        font=("Arial", 9)).pack(side=L, padx=12)
@@ -6005,6 +6633,9 @@ class ElhagryERP(Phase2Mixin):
                 body.grid_columnconfigure(c, weight=1, uniform=f"dash_{gkey}")
         for c in range(2):
             groups.grid_columnconfigure(c, weight=1, uniform="dash_groups")
+        self.dash_formula = tk.Label(page, text="", bg=P["bg"], fg=P["label"], font=("Arial", 9, "bold"),
+                                     anchor=anchor, justify="right" if rtl else "left", wraplength=1200)
+        self.dash_formula.pack(fill="x", padx=18, pady=(0, 2))
 
         # ---- الرسوم بنفس ترتيب المجموعات
         charts = tk.Frame(page, bg=P["bg"])
@@ -6027,6 +6658,30 @@ class ElhagryERP(Phase2Mixin):
             self.load_dashboard_data()
         else:
             self._render_dashboard()
+
+    def open_dashboard_sources(self):
+        """نافذة: مصدر ومعادلة كل رقم في اللوحة، ومطابقة قائمة الدخل مع HansaWorld لكل فترة مرجعية."""
+        win = tk.Toplevel(self.root)
+        win.title("مصادر أرقام لوحة المؤشرات ومطابقتها")
+        win.geometry("1250x620")
+        bar = tk.Frame(win)
+        bar.pack(fill="x", padx=8, pady=(8, 0))
+        box = self._report_box(win, height=18)
+
+        def show(kind):
+            try:
+                rep_ = REPORT_INDEX["dash_src" if kind == "src" else "hw_pl"][1]({})
+            except Exception as e:
+                handle_error(e)
+                return
+            clear_tree(box["tree"])
+            self._show_report(box, rep_)
+
+        money_button(bar, "ℹ️ مصدر كل رقم ومعادلته", UI["primary"], lambda: show("src"), 9).pack(side="right", padx=3)
+        if "hw_pl" in REPORT_INDEX:
+            money_button(bar, "⚖️ مطابقة قائمة الدخل مع HansaWorld", "#15803d", lambda: show("hw"), 9
+                         ).pack(side="right", padx=3)
+        show("src")
 
     # ---------------- البيانات والعرض
     def load_dashboard_data(self, silent=False):
@@ -6064,6 +6719,13 @@ class ElhagryERP(Phase2Mixin):
                 lbl.config(fg=P["pos"] if v >= 0 else P["neg"])
             else:
                 lbl.config(fg=P["neg"] if v < -0.005 else P["ink"])
+        if getattr(self, "dash_formula", None) is not None:
+            text = self._dt("formula", *(fmt(m.get(k, 0.0)) for k in (
+                "sales", "cogs", "gross", "other_income", "expenses", "depreciation", "profit")))
+            text += "\n" + self._dt("breakdown", *(fmt(m.get(k, 0.0)) for k in ("opex_selling", "opex_admin", "opex_other")))
+            for w in m.get("warnings") or []:
+                text += "\n⚠️ " + w
+            self.dash_formula.config(text=text, fg=P["neg"] if m.get("warnings") else P["label"])
         if ex is not None:
             self.dash_chart_data["expiry"] = [
                 (self._dt("x_expired"), ex["expired_value"], P["neg"]),
@@ -6185,8 +6847,11 @@ class ElhagryERP(Phase2Mixin):
         money_button(cbar, "🔗 تسوية الدفعات المقدمة للطرف", UI["teal"], self.settle_party_advances, 9).pack(side="right", padx=6)
         self.cash_pay_lbl = tk.Label(f, text="", fg="#15803d", font=(UI_FONT, 10, "bold"), justify="right", anchor="e")
         self.cash_pay_lbl.grid(row=4, column=0, columnspan=8, sticky="e")
+        self.build_alloc_panel(frame)
+        self.c_amount.bind("<KeyRelease>", lambda e: self.update_alloc_summary(), add="+")
         if not types:
             f.pack_forget()
+            self.alloc_box.pack_forget()
         show_register = self.can("cash.register")
 
         flt = ttk.LabelFrame(frame, text=" بحث وتصفية السندات ", padding=6)
@@ -6213,6 +6878,10 @@ class ElhagryERP(Phase2Mixin):
                          ).pack(side="right", padx=3)
             money_button(adm, "✏️ تعديل السند المحدد", "#d97706", self.edit_voucher_dialog, 9).pack(side="left", padx=3)
             money_button(adm, "🗑️ حذف السند المحدد", "#dc2626", self.delete_voucher_selected, 9).pack(side="left", padx=3)
+        attf = tk.Frame(frame)
+        attf.pack(fill="x", padx=10, pady=(2, 0))
+        money_button(attf, "📎 مرفقات السند المحدد (رفع / معاينة / تحميل)", UI["teal"], self.open_voucher_attachments_selected,
+                     9).pack(side="right", padx=3)
 
         box = ttk.LabelFrame(frame, text=" تقرير الخزينة (اضغط مرتين على سند لعرضه وطباعته) ", padding=8)
         if show_register:
@@ -6226,7 +6895,8 @@ class ElhagryERP(Phase2Mixin):
         self.cash_tree = make_tree(holder, [
             ("id", "رقم السند", 70, "center"), ("type", "النوع", 60, "center"), ("date", "التاريخ", 90, "center"),
             ("bank", "الحساب", 130, "center"), ("cat", "التصنيف", 110, "center"), ("party", "الطرف / البند", 200, "e"),
-            ("amount", "المبلغ", 100, "center"), ("inv", "الفاتورة المسددة", 130, "center"), ("desc", "البيان", 200, "center")])
+            ("amount", "المبلغ", 100, "center"), ("inv", "الفاتورة المسددة", 130, "center"), ("desc", "البيان", 200, "center"),
+            ("att", "📎", 40, "center")])
         self.cash_tree.bind("<Double-1>", self.on_cash_row_double_click)
         self.load_cash_transactions()
         self.update_party_options()
@@ -6248,6 +6918,21 @@ class ElhagryERP(Phase2Mixin):
             amount = parse_float(self.c_amount.get())
             alloc = self.open_inv_cb.selected() if category == CAT_PARTNER else None
             self.check_period_open(t_date)
+            spread = {k: v for k, v in getattr(self, "alloc_map", {}).items() if v > 0.005} if category == CAT_PARTNER else {}
+            if spread:
+                if amount is None or amount <= 0:
+                    raise UserError("أدخل مبلغ السند أولاً.")
+                vid, used = _controls.save_allocated_voucher(t_type, t_date, self.c_bank.get(), party, amount, spread,
+                                                             self.c_desc.get())
+                left = round(amount - used, 2)
+                self.c_amount.delete(0, tk.END)
+                self.c_desc.delete(0, tk.END)
+                self.load_cash_transactions()
+                self.refresh_open_invoices()
+                self._offer_voucher_attachment(vid, f"تم حفظ السند رقم {vid} على «{self.c_bank.get()}» بمبلغ {fmt(amount)}.\n"
+                                                    f"وُزّع {fmt(used)} على {len(spread)} فاتورة" +
+                                               (f"، والباقي {fmt(left)} دفعة تحت الحساب." if left > 0.005 else "."))
+                return
             vid = save_voucher(t_type, t_date, self.c_bank.get(), category, party, amount, alloc, self.c_desc.get())
 
             self.c_amount.delete(0, tk.END)
@@ -6256,9 +6941,14 @@ class ElhagryERP(Phase2Mixin):
                 self.cash_pay_lbl.configure(text="✅ تم الحفظ. ارجع لكشف الحساب أو الفاتورة من «مسار العمل» أعلى الشاشة.")
             self.load_cash_transactions()
             self.refresh_open_invoices()
-            messagebox.showinfo("نجاح", f"تم حفظ السند رقم {vid} وتسوية الحساب.")
+            self._offer_voucher_attachment(vid, f"تم حفظ السند رقم {vid} وتسوية الحساب.")
         except Exception as e:
             handle_error(e)
+
+    def _offer_voucher_attachment(self, vid, msg):
+        """بعد حفظ السند (مثل فواتير الموردين): عرض إرفاق صورة/PDF المستند الأصلي فوراً."""
+        if vid and messagebox.askyesno("نجاح", msg + "\n\nهل تريد إرفاق صورة / PDF المستند المؤيد للسند الآن؟"):
+            self.open_attachments_window("voucher", vid, upload_now=True)
 
     def load_cash_transactions(self):
         clear_tree(self.cash_tree)
@@ -6272,13 +6962,21 @@ class ElhagryERP(Phase2Mixin):
         if q:
             sql += " AND (party_name LIKE ? OR description LIKE ? OR CAST(trans_id AS TEXT) = ?)"
             params += [f"%{q}%", f"%{q}%", q]
+        att = attachment_counts("voucher")
         with db() as conn:
             nos = {("sales", i): n for i, n in conn.execute("SELECT invoice_id, invoice_no FROM sales_invoices")}
             nos.update({("purchase", i): n for i, n in conn.execute("SELECT purchase_id, invoice_no FROM purchase_invoices")})
+            spread = {t: (k, n, i) for t, k, n, i in conn.execute(
+                "SELECT trans_id, MIN(kind), COUNT(DISTINCT invoice_id), MIN(invoice_id) FROM advance_allocations GROUP BY trans_id")}
             for r in conn.execute(sql + " ORDER BY trans_date DESC, trans_id DESC", params):
                 inv = (f"{'مبيعات' if r[7] == 'sales' else 'مشتريات'} {nos.get((r[7], r[8]), r[8])}"
                        if r[7] in ("sales", "purchase") else "-")
-                self.cash_tree.insert("", "end", iid=str(r[0]), values=(r[0], r[1], r[2], r[3], r[4], r[5], fmt(r[6]), inv, r[9] or "-"))
+                if inv == "-" and r[0] in spread:
+                    k, n, i = spread[r[0]]
+                    inv = (f"{'مبيعات' if k == 'sales' else 'مشتريات'} {nos.get((k, i), i)}" if n == 1
+                           else f"موزع على {n} فواتير")
+                self.cash_tree.insert("", "end", iid=str(r[0]), values=(r[0], r[1], r[2], r[3], r[4], r[5], fmt(r[6]), inv, r[9] or "-",
+                                                                   f"📎{att[r[0]]}" if att.get(r[0]) else ""))
                 if r[1] == "قبض":
                     total_in += r[6]
                 else:
@@ -6288,6 +6986,11 @@ class ElhagryERP(Phase2Mixin):
                                      f"الصافي: {fmt(total_in - total_out)}")
         self.accounts_lbl.config(text="أرصدة الحسابات (سندات + قيود، كل الفترات):  " +
                                       ("   |   ".join(f"{b}: {fmt(v)}" for b, v in balances) or "لا توجد حركات"))
+
+    def open_voucher_attachments_selected(self):
+        tid = self._selected_voucher()
+        if tid is not None:
+            self.open_attachments_window("voucher", tid)
 
     def _selected_voucher(self):
         sel = self.cash_tree.selection()
@@ -6458,6 +7161,18 @@ class ElhagryERP(Phase2Mixin):
         rtl_row(flt, 1, [("أيام الركود/الانقطاع:", self.rep_stale_e), ("مهلة تأخر الأوامر (يوم):", self.rep_late_e),
                          ("تنبيه الصلاحية (يوم):", self.rep_expiry_e)])
         rtl_row(flt, 3, [("المندوب (تقرير مدير المبيعات):", self.rep_rep_cb), ("العميل:", self.rep_cust_cb)], slots=4)
+        # خيارات تقارير العملاء / الموردين / المقاصة
+        self.rep_mode_cb = ttk.Combobox(flt, values=list(PT_MODES.values()), state="readonly", width=14)
+        self.rep_mode_cb.set(PT_MODES["summary"])
+        self.rep_mode_cb.bind("<<ComboboxSelected>>", lambda e: self.rep_current in PARTY_REPORTS and self.run_current_report())
+        self.rep_nonzero_var = tk.BooleanVar(value=False)
+        self.rep_shared_var = tk.BooleanVar(value=False)
+        rerun = lambda: self.rep_current in PARTY_REPORTS and self.run_current_report()  # noqa: E731
+        rtl_row(flt, 4, [("العرض (تقارير العملاء/الموردين/المقاصة):", self.rep_mode_cb),
+                         (None, ttk.Checkbutton(flt, text="الأرصدة غير الصفرية فقط", variable=self.rep_nonzero_var,
+                                                command=rerun)),
+                         (None, ttk.Checkbutton(flt, text="الأطراف المشتركة (عميل ومورد) فقط", variable=self.rep_shared_var,
+                                                command=rerun))], slots=4)
         bf = tk.Frame(flt)
         bf.grid(row=2, column=0, columnspan=8, pady=4)
         money_button(bf, "🔍 عرض التقرير", "#0284c7", self.run_current_report, 10).pack(side="left", padx=4)
@@ -6484,6 +7199,8 @@ class ElhagryERP(Phase2Mixin):
         tree_box.grid_rowconfigure(0, weight=1)
         tree_box.grid_columnconfigure(0, weight=1)
         self.rep_tree.tag_configure("total", background="#fde68a", font=("Arial", 9, "bold"))
+        for stl, bg in (("group", "#e0e7ff"), ("sub", "#f1f5f9"), ("shared", "#fce7f3"), ("net", "#dcfce7")):
+            self.rep_tree.tag_configure(f"pt_{stl}", background=bg, font=("Arial", 9, "bold"))
         self.rep_chart = tk.Canvas(area, height=150, bg="white", highlightthickness=1, highlightbackground="#cbd5e1")
         self.rep_chart.pack(fill="x", padx=6, pady=4)
         self.rep_current = None
@@ -6556,7 +7273,9 @@ class ElhagryERP(Phase2Mixin):
             raise UserError("اختر العميل من القائمة أو اترك الحقل فارغاً لكل العملاء.")
         return dict(d_from=d1, d_to=d2, group="month" if self.rep_group_cb.get() == "شهري" else "day",
                     stale_days=int(stale), late_days=int(late), expiry_days=int(expd),
-                    rep="" if rep_name in ("", "كل المناديب") else rep_name, customer=cust or "")
+                    rep="" if rep_name in ("", "كل المناديب") else rep_name, customer=cust or "",
+                    mode=next((k for k, v in PT_MODES.items() if v == self.rep_mode_cb.get()), "summary"),
+                    nonzero=self.rep_nonzero_var.get(), shared_only=self.rep_shared_var.get())
 
     def run_current_report(self):
         if not self.rep_current:
@@ -6566,8 +7285,11 @@ class ElhagryERP(Phase2Mixin):
             rep = run_report(self.rep_current, self.report_params())
             self.rep_last = rep
             configure_tree(self.rep_tree, rep.columns, getattr(rep, "highlight", ()))
-            for row in rep.rows:
-                self.rep_tree.insert("", "end", values=[fmt_cell(v, k) for v, (_, k) in zip(row, rep.columns)])
+            styles = getattr(rep, "row_styles", {}) or {}
+            for i, row in enumerate(rep.rows):
+                stl = styles.get(i)
+                self.rep_tree.insert("", "end", values=[fmt_cell(v, k) for v, (_, k) in zip(row, rep.columns)],
+                                     tags=(f"pt_{stl}",) if stl else ())
             if rep.total:
                 self.rep_tree.insert("", "end", values=[fmt_cell(v, k) for v, (_, k) in zip(rep.total, rep.columns)], tags=("total",))
             self.rep_note_lbl.config(text="\n".join([f"{rep.title}  |  {rep.subtitle}"] + rep.notes))

@@ -85,7 +85,7 @@ def test_web_shows_it_first_with_filters(data):
     F = data[0]
     from streamlit.testing.v1 import AppTest
     at = AppTest.from_file(os.path.join(ROOT, "streamlit_app.py"), default_timeout=120)
-    at.session_state["user"] = F.authenticate(F.DEFAULT_ADMIN_USER, "Elhagry2012@")
+    at.session_state["user"] = F.authenticate(F.main_admin_user(), os.environ["ELHAGRY_ADMIN_PASSWORD"])
     at.session_state["last_seen"] = time.time()
     at.session_state["nav"] = "reports"
     at.run()

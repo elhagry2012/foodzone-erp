@@ -8,6 +8,7 @@ elhagry_core — المحرك المحاسبي لنظام الحاجري الم�
     credit    الحد الائتماني للعملاء (تنبيه / منع البيع الآجل)
     planning  توقع التدفق النقدي، الموازنة التقديرية مقابل الفعلي، عمولات المناديب
     controls  الأدوار والصلاحيات، مرفقات استلام المخزن، تسوية الدفعات المقدمة، تقرير الفواتير المفتوحة
+    hansa_import  مستورد HansaWorld (العملاء، الموردون، حركات وتكلفة الأصناف) + تقرير المطابقة
     audit     سجل التدقيق والرقابة الداخلية (غير قابل للتعديل أو الحذف)
 
 الاستخدام:
@@ -20,6 +21,7 @@ from .ledger import *  # noqa: F401,F403
 from .credit import *  # noqa: F401,F403
 from .planning import *  # noqa: F401,F403
 from .controls import *  # noqa: F401,F403
+from . import hansa_import  # noqa: F401   (مستورد HansaWorld: جداول الترحيل + تقرير المطابقة)
 from .audit import *  # noqa: F401,F403   (آخر وحدة: مشغلات التدقيق تُنشأ بعد كل الجداول)
 from . import audit, ledger, credit, planning, controls  # noqa: F401
 

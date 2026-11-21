@@ -39,7 +39,7 @@ def test_new_permissions_and_report_groups(erp):
     F = erp
     for k in ("ledger", "planning", "audit", "reports.ledger", "reports.plan"):
         assert k in F.ALL_PERMISSION_KEYS
-    admin = F.authenticate(F.DEFAULT_ADMIN_USER, "Elhagry2012@")
+    admin = F.authenticate(F.main_admin_user(), os.environ["ELHAGRY_ADMIN_PASSWORD"])
     assert {"ledger", "planning", "audit", "reports.plan"} <= set(admin["perms"])
     assert len(F.REPORT_GROUP_KEYS) == len(F.REPORT_CATALOG)
 

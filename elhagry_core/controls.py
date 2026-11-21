@@ -323,6 +323,122 @@ def delete_allocation(alloc_id):
 
 
 # ============================================================
+# 🧾 سند واحد موزّع على عدة فواتير مفتوحة (Invoice Allocation)
+# ============================================================
+# التصميم: سند القبض/الصرف يُسجَّل حركة واحدة على الخزينة/البنك (بدون ربط مباشر بفاتورة)، وتوزيعه التفصيلي على
+# الفواتير يُحفظ في advance_allocations (سطر لكل فاتورة) داخل نفس المعاملة. لذلك:
+#   - المسدد والمتبقي وحالة كل فاتورة تتحدث فوراً (refresh_invoice_paid يجمع السندات المباشرة + التوزيعات).
+#   - ما لم يُوزَّع من مبلغ السند يبقى «تحت الحساب» ويمكن تسويته لاحقاً من نفس الشاشة.
+#   - حذف السند يلغي توزيعاته ويعيد الفواتير مفتوحة.
+def voucher_kind(t_type):
+    return "sales" if t_type == "قبض" else "purchase"
+
+
+def party_open_invoices(kind, party_code):
+    """الفواتير المفتوحة للطرف، الأقدم أولاً:
+    [dict(inv_id, no, date, total, paid, remaining)] — paid = المسدد سابقاً (سندات + توزيعات + خصومات لاحقة)."""
+    c = FLOW[kind]
+    out = []
+    with db() as conn:
+        rows = conn.execute(f"SELECT {c['iid']}, COALESCE(invoice_no, {c['iid']}), {c['idate']}, total_amount "
+                            f"FROM {c['inv']} WHERE {c['pcode']}=? AND status='مفتوحة' "
+                            f"ORDER BY {c['idate']}, {c['iid']}", (party_code,)).fetchall()
+        for iid, no, d, total in rows:
+            rem, _ = _invoice_remaining(conn, kind, iid)
+            if rem <= 0.005:
+                continue
+            out.append(dict(inv_id=iid, no=str(no), date=d, total=round(total, 2), paid=round(total - rem, 2),
+                            remaining=rem))
+    return out
+
+
+def fifo_allocation(invoices, amount):
+    """توزيع تلقائي (الأقدم فالأحدث): فاتورة كاملة ثم جزء من التالية حتى ينفد المبلغ. يرجع {inv_id: المبلغ}."""
+    left = round(amount or 0.0, 2)
+    out = {}
+    for inv in sorted(invoices, key=lambda r: (r["date"] or "", r["inv_id"])):
+        if left <= 0.005:
+            break
+        take = round(min(left, inv["remaining"]), 2)
+        if take > 0.005:
+            out[inv["inv_id"]] = take
+            left = round(left - take, 2)
+    return out
+
+
+def validate_allocation(conn, kind, party_code, amount, allocations):
+    """allocations = {inv_id: مبلغ}. يتحقق: كل فاتورة للطرف ومفتوحة، المخصص ≤ متبقيها، والإجمالي ≤ مبلغ السند.
+    يرجع [(inv_id, مبلغ)] بعد حذف الأصفار."""
+    clean = []
+    for inv_id, amt in (allocations or {}).items():
+        amt = round(float(amt or 0), 2)
+        if amt < 0:
+            raise UserError("لا يمكن تخصيص مبلغ سالب لفاتورة.")
+        if amt <= 0.005:
+            continue
+        rem, h = _invoice_remaining(conn, kind, int(inv_id))
+        if h[2] != party_code:
+            raise UserError(f"الفاتورة {h[4]} لا تخص الطرف المختار.")
+        if h[3] != "مفتوحة" or rem <= 0.005:
+            raise UserError(f"الفاتورة {h[4]} مسددة بالكامل بالفعل.")
+        if amt > rem + 0.005:
+            raise UserError(f"المبلغ المخصص للفاتورة {h[4]} ({fmt(amt)}) أكبر من متبقيها ({fmt(rem)}).")
+        clean.append((int(inv_id), amt))
+    total = round(sum(a for _, a in clean), 2)
+    if total > round(amount, 2) + 0.005:
+        raise UserError(f"إجمالي المبالغ الموزعة ({fmt(total)}) أكبر من مبلغ السند ({fmt(amount)}).")
+    return clean
+
+
+def save_allocated_voucher(t_type, t_date, account_bank, party, amount, allocations, description=""):
+    """سند قبض (عميل) / صرف (مورد) واحد على الخزينة أو البنك المختار، موزّع على فواتير مفتوحة.
+    allocations = {inv_id: مبلغ}؛ الباقي غير الموزع يبقى دفعة تحت الحساب. يرجع (رقم السند، إجمالي الموزع)."""
+    amount = E.check_voucher_header(t_type, t_date, CAT_PARTNER, party, amount)
+    if not party[0]:
+        raise UserError("اختر العميل / المورد من القائمة.")
+    kind = voucher_kind(t_type)
+    with db() as conn:
+        if account_bank not in E.cash_account_names(conn):
+            raise UserError(f"حساب الخزينة/البنك «{account_bank}» غير معرّف. اختره من القائمة.")
+        clean = validate_allocation(conn, kind, party[0], amount, allocations)
+        if not clean:
+            raise UserError("لم يتم تخصيص أي مبلغ على الفواتير. استخدم «توزيع تلقائي» أو أدخل المبالغ يدوياً، "
+                            "أو احفظ السند بدون فاتورة كدفعة تحت الحساب.")
+        main = max(clean, key=lambda x: x[1])[0]   # المندوب يُورَّث من الفاتورة صاحبة النصيب الأكبر
+        rep = E.voucher_rep(conn, party[0], t_date, kind, main)
+        nos = []
+        for iid, _ in clean:
+            nos.append(str(conn.execute(f"SELECT COALESCE(invoice_no, {FLOW[kind]['iid']}) FROM {FLOW[kind]['inv']} "
+                                        f"WHERE {FLOW[kind]['iid']}=?", (iid,)).fetchone()[0]))
+        desc = (description or "").strip() or (f"{'تحصيل' if kind == 'sales' else 'سداد'} فواتير: " + "، ".join(nos))
+        vid = conn.execute(
+            "INSERT INTO cash_transactions (trans_type, trans_date, account_bank, category, party_code, party_name, "
+            "amount, alloc_type, alloc_id, description, rep_name) VALUES (?,?,?,?,?,?,?,NULL,NULL,?,?)",
+            (t_type, t_date, account_bank, CAT_PARTNER, party[0], party[1], amount, desc, rep)).lastrowid
+        for iid, amt in clean:
+            conn.execute("INSERT INTO advance_allocations (trans_id, kind, invoice_id, amount, alloc_date, created_by) "
+                         "VALUES (?,?,?,?,?,?)", (vid, kind, iid, amt, t_date, current_user_name()))
+            refresh_invoice_paid(conn, kind, iid)
+    return vid, round(sum(a for _, a in clean), 2)
+
+
+def voucher_allocations(trans_id):
+    """توزيع السند على الفواتير: مباشر (alloc_id) + توزيعات. [(نوع، inv_id، رقم الفاتورة، المبلغ)]."""
+    out = []
+    with db() as conn:
+        r = conn.execute("SELECT COALESCE(alloc_type,''), alloc_id, amount FROM cash_transactions WHERE trans_id=?",
+                         (trans_id,)).fetchone()
+        if r is None:
+            return out
+        if r[0] in FLOW and r[1]:
+            out.append((r[0], r[1], E.invoice_number(r[0], r[1]), r[2]))
+        for k, iid, amt in conn.execute("SELECT kind, invoice_id, SUM(amount) FROM advance_allocations WHERE trans_id=? "
+                                        "GROUP BY kind, invoice_id ORDER BY MIN(alloc_id)", (trans_id,)):
+            out.append((k, iid, E.invoice_number(k, iid), round(amt, 2)))
+    return out
+
+
+# ============================================================
 # 📑 تقرير الفواتير المفتوحة (غير المسددة / المسددة جزئياً) + تقرير الدفعات المقدمة
 # ============================================================
 OPEN_INV_COLUMNS = [("رقم الفاتورة", "t"), ("التاريخ", "t"), ("الكود", "t"), ("الطرف", "t"), ("الإجمالي", "m"),

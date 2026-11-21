@@ -28,7 +28,7 @@ import sys
 import os
 import sqlite3
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, date, timedelta
 from xml.sax.saxutils import escape
 
@@ -59,10 +59,42 @@ except Exception:
 # المحرك داخل الحزمة elhagry_core/؛ مجلد البرنامج = المجلد الأعلى منها (حيث قاعدة البيانات والدليل والشعارات)
 APP_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False)
            else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def load_env_file(*paths):
+    """يحمّل الإعدادات الحساسة من ملف .env (KEY=VALUE) دون استبدال متغيرات البيئة الموجودة فعلاً.
+    الملف محلي فقط (في .gitignore) — انظر .env.example. ELHAGRY_NO_DOTENV=1 يعطّل التحميل (الاختبارات)."""
+    if os.environ.get("ELHAGRY_NO_DOTENV") == "1":
+        return
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            k, v = ln.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k.startswith("export "):
+                k = k[7:].strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                v = v[1:-1]
+            if k:
+                os.environ.setdefault(k, v)
+
+
+load_env_file(os.path.join(APP_DIR, ".env"))
 DATA_DIR = os.environ.get("ELHAGRY_DATA_DIR") or APP_DIR
+if os.path.abspath(DATA_DIR) != os.path.abspath(APP_DIR):
+    load_env_file(os.path.join(DATA_DIR, ".env"))
 DB_FILE = os.environ.get("ELHAGRY_DB") or os.path.join(DATA_DIR, 'accounting.db')
 EXCEL_PATH = os.path.join(APP_DIR, 'charts of account.xlsx')
 BACKUP_DIR = os.path.join(DATA_DIR, 'backups')
+# المرفقات تُحفظ كملفات في مجلد (خارج git) وقاعدة البيانات تحفظ بياناتها ومسارها فقط
+ATTACH_DIR = os.environ.get("ELHAGRY_ATTACH_DIR") or os.path.join(DATA_DIR, 'attachments')
 VAT_RATE = 0.15
 EPS = 1e-6
 
@@ -84,6 +116,10 @@ TYPE_ASSET, TYPE_LIAB, TYPE_EQUITY, TYPE_REV, TYPE_EXP = "أصول", "خصوم",
 ACCOUNT_TYPES = [TYPE_ASSET, TYPE_LIAB, TYPE_EQUITY, TYPE_REV, TYPE_EXP]
 # حسابات يحسبها النظام تلقائياً (تكلفة المبيعات، مردودات المشتريات، الإهلاك): لا تُضاف من القيود لقائمة الدخل منعاً للازدواج
 SYSTEM_PL_PREFIXES = ("4111", "412", "42")
+# أكواد الشركاء القديمة المؤرشفة (OLD-...) بعد إعادة الترقيم بأكواد HansaWorld: تبقى بقاعدة البيانات للمرجعية والمطابقة
+# ولا تظهر في القوائم والتقارير ولا تدخل في ربط العميل بالمورد.
+ARCHIVED_PARTNER_PREFIX = "OLD-"
+ACTIVE_PARTNER_SQL = f"partner_code NOT LIKE '{ARCHIVED_PARTNER_PREFIX}%'"
 # حسابات لا تُصرف نقداً بسند مصروفات
 NON_CASH_EXPENSE_PREFIXES = SYSTEM_PL_PREFIXES + ("413",)
 DEFAULT_EXPENSES = ["إيجار", "رواتب وأجور", "كهرباء ومياه", "مواصلات ونقل",
@@ -99,8 +135,11 @@ MIGRATION_NOTE = None
 BRAND_AR = "نظام الحاجري المالي"
 BRAND_EN = "ELHAGRY Financial Systems"
 BRAND_FULL = f"{BRAND_AR} | {BRAND_EN}"
-DEFAULT_ADMIN_USER = "momar"
-DEFAULT_ADMIN_PASSWORD = "Elhagry2012@"
+# لا توجد بيانات دخول مكتوبة في الكود: المدير الرئيسي يُحفظ اسمه في app_settings (main_admin_user)، وكلمة مروره مشفرة
+# (PBKDF2) في جدول المستخدمين. لقاعدة جديدة: ELHAGRY_ADMIN_USER / ELHAGRY_ADMIN_PASSWORD من .env أو Secrets،
+# وإلا تُولَّد كلمة مرور عشوائية وتُكتب مرة واحدة في initial_admin_password.txt بمجلد البيانات.
+MAIN_ADMIN_KEY = "main_admin_user"
+INITIAL_PASSWORD_FILE = "initial_admin_password.txt"
 PBKDF2_ITERATIONS = 200_000
 MAX_FAILED_LOGINS = 5
 LOCKOUT_MINUTES = 5
@@ -775,6 +814,7 @@ CREATE INDEX IF NOT EXISTS idx_jl_entry ON journal_lines(entry_id);
 # أعمدة تُضاف للجداول القديمة (تغطي قاعدة النسخة السابقة وقاعدة النسخة الأحدث). آمنة للتكرار.
 NEW_COLUMNS = [
     ("users", "role_id", "INTEGER"),
+    ("attachments", "file_path", "TEXT"),   # مسار الملف داخل مجلد المرفقات (المرفقات القديمة تبقى داخل القاعدة)
     ("cash_transactions", "rep_name", "TEXT"),   # المندوب الموروث تلقائياً (للعمولات على التحصيلات)
     ("sales_invoice_lines", "delivery_line_id", "INTEGER"),
     ("purchase_invoice_lines", "receipt_line_id", "INTEGER"),
@@ -829,6 +869,8 @@ NEW_COLUMNS = [
     ("business_partners", "credit_limit", "REAL NOT NULL DEFAULT 0"),
     ("business_partners", "credit_days", "INTEGER"),
     ("business_partners", "credit_policy", "TEXT"),
+    # آخر سعر شراء للصنف (من ملف تكلفة HansaWorld «Last Price») — مرجع للتسعير فقط، لا يدخل في متوسط التكلفة
+    ("inventory", "last_purchase_price", "REAL NOT NULL DEFAULT 0"),
 ]
 
 # الخصم اللاحق بعد الشراء/البيع (إشعار خصم من المورد / إشعار دائن للعميل).
@@ -902,24 +944,30 @@ DROP VIEW IF EXISTS v_stock_in;
 CREATE VIEW v_stock_in AS
     SELECT h.purchase_date AS mdate, h.created_at AS created_at, l.item_code AS item_code,
            l.quantity AS qty, l.unit_cost AS unit_price, l.subtotal AS value,
-           h.supplier_name AS party, 'مشتريات (فاتورة)' AS mtype, h.notes AS notes
+           h.supplier_name AS party, 'مشتريات (فاتورة)' AS mtype, h.notes AS notes,
+           'فاتورة مشتريات ' || COALESCE(h.invoice_no, h.purchase_id) AS ref, h.supplier_code AS party_code,
+           l.unit_cost AS unit_cost, 'purchase' AS doc_kind, h.purchase_id AS doc_id
     FROM purchase_invoice_lines l JOIN purchase_invoices h ON h.purchase_id = l.purchase_id
     WHERE l.receipt_line_id IS NULL
     UNION ALL
     SELECT r.receipt_date, r.created_at, l.item_code, l.quantity, l.unit_cost,
-           ROUND(l.quantity * l.unit_cost, 2), r.supplier_name, 'استلام مخزني', r.notes
+           ROUND(l.quantity * l.unit_cost, 2), r.supplier_name, 'استلام مخزني', r.notes,
+           'إذن استلام ' || r.receipt_id, r.supplier_code, l.unit_cost, 'receipt', r.receipt_id
     FROM purchase_receipt_lines l JOIN purchase_receipts r ON r.receipt_id = l.receipt_id;
 
 DROP VIEW IF EXISTS v_stock_out;
 CREATE VIEW v_stock_out AS
     SELECT h.invoice_date AS mdate, h.created_at AS created_at, l.item_code AS item_code,
            l.quantity AS qty, l.unit_price AS unit_price, l.subtotal AS value,
-           h.customer_name AS party, 'مبيعات (فاتورة)' AS mtype, h.notes AS notes
+           h.customer_name AS party, 'مبيعات (فاتورة)' AS mtype, h.notes AS notes,
+           'فاتورة مبيعات ' || COALESCE(h.invoice_no, h.invoice_id) AS ref, h.customer_code AS party_code,
+           l.unit_cost AS unit_cost, 'sales' AS doc_kind, h.invoice_id AS doc_id
     FROM sales_invoice_lines l JOIN sales_invoices h ON h.invoice_id = l.invoice_id
     WHERE l.delivery_line_id IS NULL
     UNION ALL
     SELECT d.delivery_date, d.created_at, l.item_code, l.quantity, l.unit_price,
-           ROUND(l.quantity * l.unit_price - COALESCE(l.discount_amount, 0), 2), d.customer_name, 'تسليم للعميل', d.notes
+           ROUND(l.quantity * l.unit_price - COALESCE(l.discount_amount, 0), 2), d.customer_name, 'تسليم للعميل', d.notes,
+           'إذن تسليم ' || d.delivery_id, d.customer_code, l.unit_cost, 'delivery', d.delivery_id
     FROM sales_delivery_lines l JOIN sales_deliveries d ON d.delivery_id = l.delivery_id;
 
 DROP VIEW IF EXISTS v_batches;
@@ -998,16 +1046,7 @@ def init_db():
         convert_legacy_orders(conn)
         conn.executescript(VIEWS_SQL)
         conn.executescript(USERS_SQL)
-        # المدير الرئيسي momar موجود دائماً بصلاحيات كاملة وبيانات دخول ثابتة صارمة: momar / Elhagry2012@
-        if conn.execute("SELECT 1 FROM users WHERE username=?", (DEFAULT_ADMIN_USER,)).fetchone() is None:
-            conn.execute("INSERT INTO users (username, full_name, password_hash, is_admin, permissions) VALUES (?,?,?,1,?)",
-                         (DEFAULT_ADMIN_USER, "مدير النظام", hash_password(DEFAULT_ADMIN_PASSWORD), ",".join(ALL_PERMISSION_KEYS)))
-        conn.execute("UPDATE users SET is_admin=1, active=1, permissions=? WHERE username=?",
-                     (",".join(ALL_PERMISSION_KEYS), DEFAULT_ADMIN_USER))
-        stored = conn.execute("SELECT password_hash FROM users WHERE username=?", (DEFAULT_ADMIN_USER,)).fetchone()
-        if not stored or not verify_password(DEFAULT_ADMIN_PASSWORD, stored[0]):
-            conn.execute("UPDATE users SET password_hash=?, failed_attempts=0, locked_until=NULL WHERE username=?",
-                         (hash_password(DEFAULT_ADMIN_PASSWORD), DEFAULT_ADMIN_USER))
+        ensure_main_admin(conn)
         conn.executescript(SEQUENCES_SQL)
         init_sequences(conn)
         if old_version < 8:  # ترقيم موحد جديد: ELH-XXXX للأصناف، C-XXXX للعملاء، S-XXXX للموردين (الأكواد القائمة لا تتغير)
@@ -1034,7 +1073,7 @@ def init_db():
                 if ("customers" in ps or "suppliers" in ps) and "reps" not in ps:
                     conn.execute("UPDATE users SET permissions=? WHERE user_id=?", (",".join(ps + ["reps"]), uid))
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        conn.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('admin_password', '2026')")
+        secure_secret_settings(conn)
         if conn.execute("SELECT COUNT(*) FROM company_profile").fetchone()[0] == 0:
             conn.execute(f"INSERT INTO company_profile (id, {', '.join(COMPANY_FIELDS)}) VALUES (1, {', '.join('?' * len(COMPANY_FIELDS))})",
                          [COMPANY_DEFAULTS[k] for k in COMPANY_FIELDS])
@@ -1088,6 +1127,111 @@ def verify_password(password, stored):
         return hmac.compare_digest(dk.hex(), hash_hex)
     except (ValueError, AttributeError):
         return False
+
+
+def main_admin_user():
+    """اسم المدير الرئيسي (محمي من الحذف وتغيير الصلاحيات) كما هو محفوظ في الإعدادات."""
+    try:
+        return get_setting(MAIN_ADMIN_KEY, "") or ""
+    except sqlite3.Error:
+        return ""
+
+
+def _new_random_password():
+    import secrets
+    return secrets.token_urlsafe(12) + "7a"   # حروف وأرقام دائماً (شرط validate_new_password)
+
+
+def ensure_main_admin(conn):
+    """يحدد المدير الرئيسي بدون أي بيانات مكتوبة في الكود ولا يغيّر كلمة مرور موجودة:
+    - قاعدة قائمة: المدير المحفوظ في الإعدادات، وإلا ELHAGRY_ADMIN_USER لو موجود، وإلا أقدم مدير.
+    - قاعدة جديدة بلا مدير: يُنشأ ELHAGRY_ADMIN_USER (أو admin) بكلمة ELHAGRY_ADMIN_PASSWORD، أو بكلمة عشوائية
+      تُكتب مرة واحدة في initial_admin_password.txt (في .gitignore) ويجب تغييرها بعد أول دخول.
+    - استعادة الدخول: ELHAGRY_ADMIN_RESET=1 مع ELHAGRY_ADMIN_PASSWORD يضبط كلمة مرور المدير الرئيسي (مشفرة)."""
+    def exists(u):
+        return bool(u) and conn.execute("SELECT 1 FROM users WHERE username=?", (u,)).fetchone() is not None
+    row = conn.execute("SELECT value FROM app_settings WHERE key=?", (MAIN_ADMIN_KEY,)).fetchone()
+    main = row[0] if row and exists(row[0]) else None
+    env_user = (os.environ.get("ELHAGRY_ADMIN_USER") or "").strip()
+    env_pw = os.environ.get("ELHAGRY_ADMIN_PASSWORD") or ""
+    if not main:
+        if exists(env_user):
+            main = env_user
+        else:
+            r = conn.execute("SELECT username FROM users WHERE is_admin=1 ORDER BY user_id LIMIT 1").fetchone()
+            main = r[0] if r else None
+    if not main:
+        main = env_user or "admin"
+        validate_username(main)
+        pw = env_pw or _new_random_password()
+        if env_pw:
+            validate_new_password(env_pw)
+        conn.execute("INSERT INTO users (username, full_name, password_hash, is_admin, permissions) VALUES (?,?,?,1,?)",
+                     (main, "مدير النظام", hash_password(pw), ",".join(ALL_PERMISSION_KEYS)))
+        if not env_pw:
+            path = os.path.join(DATA_DIR, INITIAL_PASSWORD_FILE)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"المدير الرئيسي: {main}\nكلمة المرور المؤقتة: {pw}\n"
+                         "غيّرها بعد أول دخول ثم احذف هذا الملف. (الملف في .gitignore)\n")
+    conn.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?,?)", (MAIN_ADMIN_KEY, main))
+    conn.execute("UPDATE users SET is_admin=1, active=1, permissions=? WHERE username=?", (",".join(ALL_PERMISSION_KEYS), main))
+    if env_pw and os.environ.get("ELHAGRY_ADMIN_RESET") == "1":
+        validate_new_password(env_pw)
+        conn.execute("UPDATE users SET password_hash=?, failed_attempts=0, locked_until=NULL WHERE username=?",
+                     (hash_password(env_pw), main))
+    return main
+
+
+# كلمات المرور الإدارية في الإعدادات (لا قيم افتراضية): تُخزَّن مشفرة PBKDF2، وتُقرأ أول مرة من البيئة إن وُجدت
+SECRET_SETTINGS = {"admin_password": ("ELHAGRY_MODIFY_PASSWORD", "كلمة مرور المدير (فتح الأيام المغلقة وتجاوز الحد الائتماني)"),
+                   "reset_password": ("ELHAGRY_RESET_PASSWORD", "كلمة مرور تصفير الحركات")}
+SECRET_MIN_LEN = 4
+
+
+def _is_hashed(value):
+    return str(value or "").startswith("pbkdf2_sha256$")
+
+
+def secure_secret_settings(conn):
+    """ترحيل آمن: أي كلمة مرور إدارية محفوظة كنص صريح تُستبدل ببصمتها المشفرة (نفس كلمة المرور تبقى صالحة،
+    لا تُمسح أي بيانات). غير المضبوطة تُؤخذ من متغير البيئة إن وُجد، وإلا تبقى غير مضبوطة حتى يضبطها المدير."""
+    for key, (env, _) in SECRET_SETTINGS.items():
+        r = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+        val = (r[0] if r else "") or ""
+        if val and not _is_hashed(val):
+            conn.execute("UPDATE app_settings SET value=? WHERE key=?", (hash_password(val), key))
+        elif not val and os.environ.get(env):
+            conn.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?,?)",
+                         (key, hash_password(os.environ[env])))
+
+
+def secret_is_set(key):
+    return _is_hashed(get_setting(key, ""))
+
+
+def set_secret_setting(key, value):
+    value = (value or "").strip()
+    if len(value) < SECRET_MIN_LEN:
+        raise UserError(f"{SECRET_SETTINGS[key][1]} يجب ألا تقل عن {SECRET_MIN_LEN} أحرف/أرقام.")
+    set_setting(key, hash_password(value))
+
+
+def verify_secret_setting(key, value):
+    """True لو كلمة المرور صحيحة. يرفع UserError لو لم تُضبط بعد (لا توجد قيمة افتراضية)."""
+    stored = get_setting(key, "")
+    if not _is_hashed(stored):
+        raise UserError(f"لم تُضبط {SECRET_SETTINGS[key][1]} بعد.\n"
+                        "يضبطها مدير النظام من «بيانات الشركة والأمان» أو من متغير البيئة "
+                        f"{SECRET_SETTINGS[key][0]} في ملف .env.")
+    return verify_password((value or "").strip(), stored)
+
+
+def verify_modify_password(value):
+    return verify_secret_setting("admin_password", value)
+
+
+def set_modify_password(value):
+    set_secret_setting("admin_password", value)
 
 
 def validate_new_password(password):
@@ -1169,7 +1313,7 @@ def normalize_permissions(perms):
 
 def save_user_account(uid, uname, full, pw, pw2, is_admin, active, perms, current_user_id=None, role_id=_KEEP):
     """إضافة/تعديل مستخدم (مشتركة بين واجهة سطح المكتب والويب). perms = مفاتيح الصفحات + المفاتيح التفصيلية المختارة.
-    يحمي حساب المدير الرئيسي momar (اسمه وصلاحياته وكلمة مروره ثابتة) ويضمن بقاء مدير نشط واحد على الأقل."""
+    يحمي حساب المدير الرئيسي (اسمه وصلاحياته ثابتة) ويضمن بقاء مدير نشط واحد على الأقل."""
     uname = (uname or "").strip()
     validate_username(uname)
     full = (full or "").strip()
@@ -1191,10 +1335,9 @@ def save_user_account(uid, uname, full, pw, pw2, is_admin, active, perms, curren
             old = conn.execute("SELECT is_admin, active, username FROM users WHERE user_id=?", (uid,)).fetchone()
             if old is None:
                 raise UserError("المستخدم غير موجود.")
-            if old[2] == DEFAULT_ADMIN_USER and (uname != DEFAULT_ADMIN_USER or not is_admin or not active):
-                raise UserError(f"حساب المدير الرئيسي «{DEFAULT_ADMIN_USER}» لا يمكن تغيير اسمه أو صلاحياته أو إيقافه.")
-            if old[2] == DEFAULT_ADMIN_USER and pw:
-                raise UserError(f"كلمة مرور المدير الرئيسي «{DEFAULT_ADMIN_USER}» ثابتة ولا يمكن تغييرها.")
+            main = main_admin_user()
+            if old[2] == main and (uname != main or not is_admin or not active):
+                raise UserError(f"حساب المدير الرئيسي «{main}» لا يمكن تغيير اسمه أو صلاحياته أو إيقافه.")
             if uid == current_user_id and (not is_admin or not active):
                 raise UserError("لا يمكنك إلغاء صلاحية المدير أو إيقاف حسابك الحالي.")
             if old[0] and old[1] and (not is_admin or not active) and active_admin_count(conn, uid) == 0:
@@ -1220,8 +1363,8 @@ def delete_user_account(uid, current_user_id=None):
         r = conn.execute("SELECT username, is_admin, active FROM users WHERE user_id=?", (uid,)).fetchone()
         if r is None:
             raise UserError("المستخدم غير موجود.")
-        if r[0] == DEFAULT_ADMIN_USER:
-            raise UserError(f"لا يمكن حذف حساب المدير الرئيسي «{DEFAULT_ADMIN_USER}».")
+        if r[0] == main_admin_user():
+            raise UserError(f"لا يمكن حذف حساب المدير الرئيسي «{r[0]}».")
         if r[1] and r[2] and active_admin_count(conn, uid) == 0:
             raise UserError("لا يمكن حذف آخر مدير نشط.")
         conn.execute("DELETE FROM users WHERE user_id=?", (uid,))
@@ -1251,6 +1394,89 @@ def backup_database(reason="manual"):
         dst.close()
         src.close()
     return path
+
+
+# ============================================================
+# تصفير الحركات (للمدير فقط وبكلمة مرور التصفير) — منطق موحد لسطح المكتب والويب
+# ============================================================
+RESET_PASSWORD_KEY = "reset_password"
+# الترتيب مهم: الأبناء قبل الآباء حتى لا يرفض SQLite الحذف بسبب المفاتيح الأجنبية
+RESET_TABLES = ("advance_allocations",
+                "sales_delivery_lines", "purchase_receipt_lines", "sales_invoice_lines", "purchase_invoice_lines",
+                "sales_deliveries", "purchase_receipts", "sales_invoices", "purchase_invoices",
+                "sales_order_lines", "purchase_order_lines", "sales_orders", "purchase_orders",
+                "returns_invoices", "cash_transactions", "daily_closures", "post_discount_lines",
+                "post_discounts", "journal_lines", "journal_entries",
+                # سجل استيراد HansaWorld (يُعاد الاستيراد بعد التصفير بدون أن يُعتبر مكرراً)
+                "hw_import_map", "hw_item_history")
+RESET_SEQUENCES = ("sales_invoice", "purchase_invoice", "purchase_discount", "sales_discount")
+
+
+def reset_password_is_set():
+    return secret_is_set(RESET_PASSWORD_KEY)
+
+
+def set_reset_password(new_password):
+    set_secret_setting(RESET_PASSWORD_KEY, new_password)
+
+
+def reset_transactions(password, clear_audit=False):
+    """حذف كل المستندات والحركات وإرجاع المخزون للرصيد الافتتاحي (دليل الحسابات والشركاء والأصناف والأصول والمستخدمين تبقى).
+    يتطلب: مستخدماً مديراً (أو تشغيلاً من النظام بلا جلسة)، وكلمة مرور التصفير (الافتراضية 2026)، ونسخة احتياطية ناجحة أولاً.
+    clear_audit=True: يمسح سجل التدقيق والرقابة أيضاً (بعد النسخة الاحتياطية التي تحفظه كاملاً) ويبدأ سلسلة بصمات جديدة
+    بسطر افتتاحي واحد يوثّق المسح (المستخدم، التوقيت، عدد السطور الممسوحة، اسم النسخة الاحتياطية).
+    يرجع dict(backup=مسار النسخة، deleted={الجدول: عدد السطور المحذوفة}، audit_cleared=عدد سطور السجل الممسوحة أو None)."""
+    u = _CURRENT_PERMS.get()
+    if u is not None and not u.get("is_admin"):
+        raise UserError("تصفير الحركات متاح لمدير النظام فقط.")
+    if not verify_secret_setting(RESET_PASSWORD_KEY, password):
+        raise UserError("كلمة مرور التصفير غير صحيحة. لم يتم حذف أي بيانات.\n"
+                        "(يمكن للمدير تغييرها من الإعدادات ← كلمة مرور تصفير الحركات)")
+    try:
+        backup = backup_database("before_reset")
+    except Exception as e:  # noqa: BLE001
+        raise UserError(f"تعذر أخذ نسخة احتياطية قبل التصفير، فتم إلغاء العملية حفاظاً على البيانات.\nالسبب: {e}")
+    if not backup:
+        raise UserError(f"ملف قاعدة البيانات غير موجود:\n{DB_FILE}")
+    from . import audit as _audit   # استيراد متأخر: audit يعتمد على engine
+    deleted, audit_cleared = {}, None
+    try:
+        with db() as conn:
+            existing = {n for (n,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not clear_audit:
+                _audit.audit_event(conn, _audit.ACT_EVENT, "تصفير الحركات", "كل المستندات",
+                                   new={"backup": os.path.basename(backup)})
+            for table in RESET_TABLES:
+                if table in existing:
+                    deleted[table] = conn.execute(f"DELETE FROM {table}").rowcount
+            # مرفقات المستندات المحذوفة: بدون حذفها ستظهر على المستندات الجديدة التي تأخذ نفس الأرقام
+            rels = [p for (p,) in conn.execute(f"SELECT file_path FROM attachments WHERE doc_type IN "
+                                               f"({','.join('?' * len(ATTACH_DOCS))})", list(ATTACH_DOCS))]
+            conn.execute(f"DELETE FROM attachments WHERE doc_type IN ({','.join('?' * len(ATTACH_DOCS))})",
+                         list(ATTACH_DOCS))
+            _archive_attachment_files(rels, f"reset_{datetime.now():%Y%m%d_%H%M%S}")
+            conn.execute("UPDATE inventory SET quantity = opening_qty, cost_price = opening_cost")
+            conn.execute(f"UPDATE sequences SET next_value=1 WHERE name IN ({','.join('?' * len(RESET_SEQUENCES))})",
+                         RESET_SEQUENCES)
+            conn.execute("DELETE FROM app_settings WHERE key=?", (CASH_OPENING_SETTING,))
+            if "sqlite_sequence" in existing:
+                names = [t for t in RESET_TABLES if t in existing]
+                conn.execute(f"DELETE FROM sqlite_sequence WHERE name IN ({','.join('?' * len(names))})", names)
+            left = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in RESET_TABLES if t in existing}
+            left = {t: n for t, n in left.items() if n}
+            if left:
+                raise UserError("لم يكتمل التصفير (بقيت سطور في: " + "، ".join(f"{t}={n}" for t, n in left.items()) + ").")
+            if clear_audit and "audit_log" in existing:
+                # آخر خطوة داخل نفس المعاملة: مشغلات حذف المستندات أعلاه تكتب في السجل، فيُمسح بعدها
+                audit_cleared = _audit.clear_audit_log(conn, os.path.basename(backup), deleted)
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower() or "busy" in str(e).lower():
+            raise UserError("قاعدة البيانات مشغولة الآن بعملية أخرى (نافذة ثانية من البرنامج أو واجهة الويب تكتب عليها).\n"
+                            "أغلق الواجهات الأخرى أو انتظر لحظات ثم أعد المحاولة. لم يتم حذف أي بيانات.")
+        raise UserError(f"تعذر التصفير بسبب خطأ في قاعدة البيانات، ولم يُحذف شيء (تم التراجع الكامل).\nالتفاصيل: {e}")
+    except sqlite3.IntegrityError as e:
+        raise UserError(f"تعذر التصفير بسبب ارتباطات بين الجداول، ولم يُحذف شيء (تم التراجع الكامل).\nالتفاصيل: {e}")
+    return dict(backup=backup, deleted=deleted, audit_cleared=audit_cleared)
 
 
 def auto_backup_daily():
@@ -1368,7 +1594,8 @@ def journal_pl(conn, d_from, d_to, by_month=False):
             f"SELECT {key}, a.account_type, l.account_code, MAX(a.account_name), SUM(l.debit), SUM(l.credit) "
             f"FROM journal_lines l JOIN journal_entries e ON e.entry_id=l.entry_id "
             f"JOIN chart_of_accounts a ON a.account_code=l.account_code "
-            f"WHERE e.entry_date BETWEEN ? AND ? AND a.account_type IN (?,?) AND e.source_type IS NULL GROUP BY 1, 2, 3",
+            f"WHERE e.entry_date BETWEEN ? AND ? AND a.account_type IN (?,?) "
+            f"AND (e.source_type IS NULL OR e.source_type='hw_tb_expenses') GROUP BY 1, 2, 3",
             (d_from, d_to, TYPE_EXP, TYPE_REV)):
         if code.startswith(SYSTEM_PL_PREFIXES):
             continue
@@ -1400,51 +1627,144 @@ def expense_breakdown(conn, d_from, d_to):
     return sorted(((k, v[0], v[1]) for k, v in agg.items()), key=lambda r: r[2], reverse=True)
 
 
-def fetch_item_card(item_code, d_from, d_to):
-    """يرجع (الصفوف المنسقة، الرصيد النهائي كرقم). الحركات من الفواتير المباشرة والاستلام/التسليم والمرتجعات."""
+HW_MOVE_LABELS = {"Deld": "تسليم للعميل", "G.Rec.": "استلام من مورد", "Cust. Ret.": "مرتجع من عميل",
+                  "Ret. to Supp.": "مرتجع لمورد", "St. Depr.": "إهلاك / تالف مخزني"}
+HW_SUPPLIER_MOVES = ("G.Rec.", "Ret. to Supp.")
+ITEM_CARD_SOURCES = ("HansaWorld", "النظام")
+
+
+def item_card(item_code, d_from, d_to):
+    """كارت الصنف التفصيلي: كل حركة على حدة (حركات HansaWorld التاريخية + مستندات النظام) برصيد متحرك.
+    حركات HansaWorld (hw_item_history) تبدأ من رصيد صفر وتنتهي برصيد ملف التكلفة الذي صار الرصيد الافتتاحي للصنف،
+    فلا تُكرَّر الكمية: الرصيد الأساسي قبلها = الرصيد الافتتاحي − مجموع كمياتها (صفر عادةً).
+    يرجع dict(opening, final, moves=[dict(...)], cost, has_hw, opening_label). لكل حركة: date, src, type, ref, link,
+    party, party_code, qty_in, qty_out, qty, balance, cost, value (بالتكلفة)، doc_price, doc_value, notes,
+    key (لفتح المستند أو كشف حساب الطرف)."""
     with db() as conn:
-        row = conn.execute("SELECT opening_qty FROM inventory WHERE item_code=?", (item_code,)).fetchone()
-        opening = row[0] if row and row[0] else 0.0
+        row = conn.execute("SELECT COALESCE(opening_qty,0), COALESCE(opening_cost,0), COALESCE(cost_price,0) "
+                           "FROM inventory WHERE item_code=?", (item_code,)).fetchone()
+        if row is None:
+            raise UserError("الصنف غير موجود.")
+        opening_qty, opening_cost, avg_cost = row
+        names = dict(conn.execute("SELECT partner_code, name FROM business_partners"))
 
         def one(sql, params):
             return conn.execute(sql, params).fetchone()[0] or 0.0
 
-        p_prior = one("SELECT SUM(qty) FROM v_stock_in WHERE item_code=? AND mdate < ?", (item_code, d_from))
-        s_prior = one("SELECT SUM(qty) FROM v_stock_out WHERE item_code=? AND mdate < ?", (item_code, d_from))
-        rs_prior = one("SELECT SUM(quantity) FROM returns_invoices WHERE item_code=? AND return_type=? "
-                       "AND return_date < ?", (item_code, SALES_RETURN, d_from))
-        rp_prior = one("SELECT SUM(quantity) FROM returns_invoices WHERE item_code=? AND return_type=? "
-                       "AND return_date < ?", (item_code, PURCHASE_RETURN, d_from))
-        running = opening + p_prior + rs_prior - s_prior - rp_prior
+        try:
+            hw_rows = conn.execute(
+                "SELECT move_date, src_row, move_type, COALESCE(reference,''), COALESCE(party_text,''), "
+                "COALESCE(party_code,''), qty, COALESCE(link_doc_type,''), COALESCE(link_doc_no,''), is_duplicate, "
+                "COALESCE(location,'') FROM hw_item_history WHERE item_code=? ORDER BY move_date, src_row",
+                (item_code,)).fetchall()
+        except sqlite3.OperationalError:
+            hw_rows = []
+        hw_docs = {}
+        if hw_rows:   # المستند المربوط في HansaWorld ← مستنده المستورد في النظام (لفتحه من الكارت)
+            kinds = {"sales_invoices": "sales", "purchase_invoices": "purchase", "post_discounts": "discount"}
+            for role, typ, no, target, tid in conn.execute(
+                    "SELECT role, doc_type, doc_no, target, target_id FROM hw_import_map WHERE target IN (?,?,?)",
+                    tuple(kinds)):
+                hw_docs.setdefault((role, typ, str(no)), (kinds[target], tid))
+        hw_total = sum(r[6] or 0.0 for r in hw_rows)
+        base = round(opening_qty - hw_total, 6) if hw_rows else opening_qty
+        sys_prior = (one("SELECT SUM(qty) FROM v_stock_in WHERE item_code=? AND mdate < ?", (item_code, d_from))
+                     - one("SELECT SUM(qty) FROM v_stock_out WHERE item_code=? AND mdate < ?", (item_code, d_from))
+                     + one("SELECT SUM(quantity) FROM returns_invoices WHERE item_code=? AND return_type=? "
+                           "AND return_date < ?", (item_code, SALES_RETURN, d_from))
+                     - one("SELECT SUM(quantity) FROM returns_invoices WHERE item_code=? AND return_type=? "
+                           "AND return_date < ?", (item_code, PURCHASE_RETURN, d_from)))
+        running = base + sum(r[6] or 0.0 for r in hw_rows if r[0] < d_from) + sys_prior
 
         moves = []
-        for r in conn.execute("SELECT mdate, created_at, mtype, party, qty, unit_price, value, notes FROM v_stock_in "
-                              "WHERE item_code=? AND mdate BETWEEN ? AND ?", (item_code, d_from, d_to)):
-            moves.append((r[0], r[1] or '', r[2], r[3], r[4], r[5], r[6], r[7] or "-"))
-        for r in conn.execute("SELECT mdate, created_at, mtype, party, qty, unit_price, value, notes FROM v_stock_out "
-                              "WHERE item_code=? AND mdate BETWEEN ? AND ?", (item_code, d_from, d_to)):
-            moves.append((r[0], r[1] or '', r[2], r[3], -r[4], r[5], r[6], r[7] or "-"))
+
+        def add(d, order, src, typ, ref, link, pcode, ptext, qty, cost, doc_price, doc_value, notes, key):
+            moves.append(dict(date=d, _order=order, src=src, type=typ, ref=str(ref) if ref else "-", link=link or "",
+                              party_code=pcode or "", party=(names.get(pcode) if pcode else None) or ptext or "-",
+                              qty=qty, cost=cost, doc_price=doc_price, doc_value=doc_value, notes=notes or "",
+                              key=key))
+
+        for d, srow, typ, ref, ptext, pcode, qty, ltype, lno, dup, loc in hw_rows:
+            if not (d_from <= d <= d_to):
+                continue
+            notes = " • ".join(x for x in (f"موقع {loc}" if loc else "", "مكرر في HansaWorld" if dup else "") if x)
+            add(d, (0, srow or 0), "HansaWorld", HW_MOVE_LABELS.get(typ, typ), ref,
+                f"{ltype} {lno}" if lno else "", pcode, ptext, qty or 0.0, opening_cost, None, None, notes,
+                hw_docs.get(("supplier" if typ in HW_SUPPLIER_MOVES else "customer", ltype, lno))
+                or (("partner", pcode) if pcode else None))
+        for view, sign in (("v_stock_in", 1), ("v_stock_out", -1)):
+            for r in conn.execute(f"SELECT mdate, created_at, mtype, party, qty, unit_price, value, notes, ref, party_code, "
+                                  f"unit_cost, doc_kind, doc_id FROM {view} WHERE item_code=? AND mdate BETWEEN ? AND ?",
+                                  (item_code, d_from, d_to)):
+                add(r[0], (1, r[1] or ""), "النظام", r[2], r[8], "", r[9], r[3], sign * (r[4] or 0.0), r[10] or 0.0,
+                    r[5], r[6], r[7], (r[11], r[12]))
         for r in conn.execute(
-                "SELECT return_date, created_at, return_type, party_name, quantity, unit_price, subtotal, notes "
-                "FROM returns_invoices WHERE item_code=? AND return_date BETWEEN ? AND ?",
+                "SELECT return_date, created_at, return_type, party_name, quantity, unit_price, subtotal, notes, return_id, "
+                "party_code, unit_cost FROM returns_invoices WHERE item_code=? AND return_date BETWEEN ? AND ?",
                 (item_code, d_from, d_to)):
             is_add = r[2] == SALES_RETURN
-            moves.append((r[0], r[1] or '', f"{r[2]} ({'إضافة' if is_add else 'خصم'})", r[3],
-                          r[4] if is_add else -r[4], r[5], r[6], r[7] or "-"))
+            add(r[0], (1, r[1] or ""), "النظام", f"{r[2]} ({'إضافة' if is_add else 'خصم'})", f"مرتجع {r[8]}", "", r[9],
+                r[3], (r[4] or 0.0) * (1 if is_add else -1), r[10] or 0.0, r[5], r[6], r[7], ("return", r[8]))
         for r in conn.execute(
-                "SELECT d.discount_date, d.created_at, d.discount_no, d.party_name, l.amount, l.applied, COALESCE(d.reason,'') "
-                "FROM post_discount_lines l JOIN post_discounts d ON d.discount_id=l.discount_id "
-                "WHERE l.item_code=? AND d.discount_date BETWEEN ? AND ?", (item_code, d_from, d_to)):
-            note = (r[6] or "-") + (f" | يخص مبيعات سابقة: {fmt(r[4] - r[5])}" if r[4] - r[5] > 0.005 else "")
-            moves.append((r[0], r[1] or '', f"خصم لاحق {r[2]} (تخفيض تكلفة بدون كمية)", r[3], 0.0, 0.0, -r[5], note))
+                "SELECT d.discount_date, d.created_at, d.discount_no, d.party_name, l.amount, l.applied, "
+                "COALESCE(d.reason,''), d.party_code, d.discount_id FROM post_discount_lines l "
+                "JOIN post_discounts d ON d.discount_id=l.discount_id WHERE l.item_code=? AND d.discount_date BETWEEN ? AND ?",
+                (item_code, d_from, d_to)):
+            note = (r[6] or "") + (f" | يخص مبيعات سابقة: {fmt(r[4] - r[5])}" if r[4] - r[5] > 0.005 else "")
+            add(r[0], (1, r[1] or ""), "النظام", "خصم لاحق (تخفيض تكلفة بدون كمية)", r[2], "", r[7], r[3], 0.0, 0.0,
+                None, -(r[5] or 0.0), note, ("discount", r[8]))
 
-    moves.sort(key=lambda m: (m[0], m[1]))
-    rows = [(d_from, "رصيد مرحّل", "-", "-", f"{running:,.3f}", "-", "-", "-")]
-    for date_s, _, m_type, party, qty, price, value, notes in moves:
-        running += qty
-        qty_str = f"+{qty:g}" if qty > 0 else (f"{qty:g}" if qty < 0 else "0")
-        rows.append((date_s, m_type, party, qty_str, f"{running:,.3f}", fmt(price), fmt(value), notes))
-    return rows, running
+    moves.sort(key=lambda m: (m["date"], m["_order"]))
+    opening = running
+    for m in moves:
+        running += m["qty"]
+        m.pop("_order")
+        m["qty_in"] = m["qty"] if m["qty"] > 0 else 0.0
+        m["qty_out"] = -m["qty"] if m["qty"] < 0 else 0.0
+        m["balance"] = running
+        m["value"] = (round(abs(m["qty"]) * m["cost"], 2) if m["qty"] else
+                      (m["doc_value"] if m["doc_value"] is not None else 0.0))
+    first = item_first_move_date(item_code)
+    return dict(opening=opening, final=running, moves=moves, cost=avg_cost, has_hw=bool(hw_rows),
+                opening_label="رصيد مرحّل" if first and first < d_from else "رصيد أول المدة")
+
+
+def item_card_rows(card, moves=None, d_from=""):
+    """صفوف العرض/الطباعة المختصرة (8 أعمدة) من item_card — تُستخدم في الويب وPDF."""
+    rows = [(d_from, card["opening_label"], "-", "-", f"{card['opening']:,.3f}", "-", "-", "-")]
+    for m in (card["moves"] if moves is None else moves):
+        q = m["qty"]
+        qty_str = f"+{q:g}" if q > 0 else (f"{q:g}" if q < 0 else "0")
+        typ = f"{m['type']} ({m['src']})" if m["src"] == "HansaWorld" else m["type"]
+        party = f"{m['party_code']} - {m['party']}" if m["party_code"] else m["party"]
+        notes = " • ".join(x for x in (f"مرجع {m['ref']}" if m["ref"] != "-" else "",
+                                        f"مربوط {m['link']}" if m["link"] else "", m["notes"]) if x) or "-"
+        rows.append((m["date"], typ, party, qty_str, f"{m['balance']:,.3f}", fmt(m["cost"]), fmt(m["value"]), notes))
+    return rows
+
+
+def fetch_item_card(item_code, d_from, d_to):
+    """يرجع (الصفوف المنسقة، الرصيد النهائي كرقم). كل الحركات التفصيلية (HansaWorld + الفواتير المباشرة والاستلام/التسليم
+    والمرتجعات والخصومات اللاحقة). السعر = التكلفة، والقيمة = الكمية × التكلفة."""
+    card = item_card(item_code, d_from, d_to)
+    return item_card_rows(card, d_from=d_from), card["final"]
+
+
+def item_first_move_date(item_code):
+    """تاريخ أول حركة للصنف (HansaWorld أو النظام) — بداية الفلتر الافتراضية في كارت الصنف، أو None."""
+    sqls = ["SELECT MIN(mdate) FROM v_stock_in WHERE item_code=?", "SELECT MIN(mdate) FROM v_stock_out WHERE item_code=?",
+            "SELECT MIN(return_date) FROM returns_invoices WHERE item_code=?",
+            "SELECT MIN(move_date) FROM hw_item_history WHERE item_code=?"]
+    found = []
+    with db() as conn:
+        for sql in sqls:
+            try:
+                v = conn.execute(sql, (item_code,)).fetchone()[0]
+            except sqlite3.OperationalError:
+                continue
+            if v:
+                found.append(v)
+    return min(found) if found else None
 
 
 def _partner_entries(conn, codes):
@@ -1641,9 +1961,18 @@ def company_name():
         return BRAND_AR
 
 
-def build_income_report(d_from, d_to):
+def income_figures(d_from, d_to, dep_to=None):
+    """أرقام قائمة الدخل للفترة — المصدر الوحيد لقائمة الدخل ولوحة المؤشرات حتى يتطابقا دائماً:
+        صافي المبيعات = المبيعات قبل الضريبة − مرتجعات المبيعات − الإشعارات الدائنة للعملاء
+        تكلفة المبيعات = تكلفة بنود الفواتير الجديدة (متوسط مرجح) − تكلفة المرتجعات + تكلفة فترة HansaWorld (جرد دوري)
+        مجمل الربح = صافي المبيعات − تكلفة المبيعات
+        فترة HansaWorld: تُسوّى تكلفتها لتساوي دفتر HansaWorld (41110 + 41201) لكل فترة مرجعية (الميزان/قوائم الدخل)
+        المصروفات التشغيلية = سندات صرف المصروفات + القيود اليومية على حسابات المصروفات (ومنها قيد تجميع أرصدة الميزان)
+            مصنفة: بيعية وتسويقية (43) / إدارية وعمومية (5) / أخرى (41125 إيجار السيارات …)
+        صافي الربح = مجمل الربح + الإيرادات الأخرى − المصروفات التشغيلية − الإهلاك.
+    dep_to: نهاية فترة الإهلاك (الافتراضي d_to)."""
     from_dt = datetime.strptime(d_from, "%Y-%m-%d").date()
-    to_dt = datetime.strptime(d_to, "%Y-%m-%d").date()
+    to_dt = datetime.strptime(dep_to or d_to, "%Y-%m-%d").date()
     with db() as conn:
         def one(sql, params=()):
             row = conn.execute(sql, params).fetchone()
@@ -1665,10 +1994,13 @@ def build_income_report(d_from, d_to):
                                       "WHERE return_type=? AND return_date BETWEEN ? AND ?",
                                       (PURCHASE_RETURN, d_from, d_to))
         expenses = [(name, amt) for name, _, amt in expense_breakdown(conn, d_from, d_to)]
+        opex_groups = expense_groups(conn, d_from, d_to)
         other_income = [(name, amt) for _, typ, _, name, amt in journal_pl(conn, d_from, d_to) if typ == TYPE_REV]
         dsc = discount_totals(conn, d_from, d_to)[""]
-        if dsc["earned"] > 0.005:
-            other_income.insert(0, ("خصم مكتسب من الموردين (خصومات لاحقة)", dsc["earned"]))
+        hw = hw_cogs(conn, d_from, d_to)[""]
+        earned = dsc["earned"] - hw["credits"]
+        if earned > 0.005:
+            other_income.insert(0, ("خصم مكتسب من الموردين (خصومات لاحقة)", earned))
         # المرتجع للمورد يخفض المخزون بمتوسط التكلفة ويخفض رصيد المورد بسعر الإرجاع: الفرق ربح/خسارة فعلية
         rp_var = round(rp_sub - rp_cost, 2)
         if abs(rp_var) > 0.005:
@@ -1683,14 +2015,28 @@ def build_income_report(d_from, d_to):
                 - accumulated_depreciation(cost, salvage, life, p_date, from_dt - timedelta(days=1)))
 
     net_sales = sales_sub - rs_sub - dsc["sales_sub"]
-    cogs = sold_cost - rs_cost
+    cogs_lines = sold_cost - rs_cost
+    cogs = cogs_lines + hw["cogs"]
     gross = net_sales - cogs
     total_other = sum(e[1] for e in other_income)
-    total_exp = sum(e[1] for e in expenses) + dep
-    net_profit = gross + total_other - total_exp
+    opex = sum(e[1] for e in expenses)
+    net_profit = gross + total_other - opex - dep
     out_vat = sales_vat - rs_vat - dsc["sales_vat"]
     in_vat = pur_vat - rp_vat - dsc["pur_vat"]
-    net_vat = out_vat - in_vat
+    return dict(sales_sub=sales_sub, sales_disc=sales_disc, rs_sub=rs_sub, dsc=dsc, hw=hw, net_sales=net_sales,
+                cogs_lines=cogs_lines, cogs=cogs, gross=gross, other_income=other_income, total_other=total_other,
+                expenses=expenses, opex=opex, opex_groups=opex_groups, dep=dep, total_exp=opex + dep, net_profit=net_profit,
+                net_purchases=pur_sub - rp_sub - dsc["pur_sub"], stock_value=stock_value,
+                out_vat=out_vat, in_vat=in_vat, net_vat=out_vat - in_vat)
+
+
+def build_income_report(d_from, d_to):
+    f = income_figures(d_from, d_to)
+    sales_sub, sales_disc, rs_sub, dsc, hw = f["sales_sub"], f["sales_disc"], f["rs_sub"], f["dsc"], f["hw"]
+    net_sales, cogs_lines, cogs, gross = f["net_sales"], f["cogs_lines"], f["cogs"], f["gross"]
+    other_income, total_other, expenses, dep = f["other_income"], f["total_other"], f["expenses"], f["dep"]
+    total_exp, net_profit, stock_value = f["total_exp"], f["net_profit"], f["stock_value"]
+    out_vat, in_vat, net_vat = f["out_vat"], f["in_vat"], f["net_vat"]
 
     def line(label, value, indent=1):
         return f"{' ' * indent}{label:<46}{value:>14,.2f} ر.س"
@@ -1706,7 +2052,16 @@ def build_income_report(d_from, d_to):
            line("(-) مرتجعات المبيعات", rs_sub),
            *([line("(-) خصومات لاحقة للعملاء (إشعارات دائنة)", dsc["sales_sub"])] if dsc["sales_sub"] > 0.005 else []),
            line("صافي المبيعات", net_sales), thin,
-           line("(-) تكلفة البضاعة المباعة (بالمتوسط المرجح)", cogs),
+           *([line("مشتريات فترة HansaWorld (قبل الضريبة)", hw["purchases"], 3),
+              line("(-) إشعارات خصم الموردين المستوردة", hw["credits"], 3),
+              line("(-) المخزون الختامي في تاريخ الترحيل", hw["closing"], 3),
+              *([line("± تسوية لدفتر HansaWorld (41110 + 41201)", hw["ref_adj"], 3)] if abs(hw["ref_adj"]) > 0.005 else []),
+              line("= تكلفة مبيعات فترة HansaWorld (جرد دوري" + (" مُسوّى لدفترها)" if abs(hw["ref_adj"]) > 0.005 else ")"),
+                   hw["cogs"], 3)]
+             if abs(hw["purchases"]) + abs(hw["closing"]) + abs(hw["ref_adj"]) > 0.005 else []),
+           *([line("تكلفة مبيعات المستندات الجديدة (بالمتوسط المرجح)", cogs_lines, 3)]
+             if abs(hw["cogs"]) > 0.005 and abs(cogs_lines) > 0.005 else []),
+           line("(-) تكلفة البضاعة المباعة" + (" (إجمالي)" if abs(hw["cogs"]) > 0.005 else " (بالمتوسط المرجح)"), cogs),
            line("مجمل الربح", gross), thin]
     if other_income:
         out.append(" إيرادات أخرى (من القيود اليومية):")
@@ -1719,12 +2074,15 @@ def build_income_report(d_from, d_to):
             out.append(line(f"- {name}", amt, 3))
     else:
         out.append("   - لا توجد مصروفات مسجلة في الفترة")
+    og = f["opex_groups"]
+    if sum(1 for v in og.values() if abs(v) > 0.005) > 1:
+        out += [line(f"منها {OPEX_GROUP_LABELS[k]}", og[k], 3) for k in ("selling", "admin", "other") if abs(og[k]) > 0.005]
     out += [line("إجمالي المصروفات التشغيلية", total_exp - dep), thin,
             line("مصروف الإهلاك (إهلاك الأصول الثابتة)", dep), thin,
             line("إجمالي المصروفات (التشغيلية + الإهلاك)", total_exp), sep,
             line("صافي الربح", net_profit), sep,
             " معلومات إضافية:",
-            line("مشتريات الفترة (قبل الضريبة، بعد المرتجعات والخصومات)", pur_sub - rp_sub - dsc["pur_sub"]),
+            line("مشتريات الفترة (قبل الضريبة، بعد المرتجعات والخصومات)", f["net_purchases"]),
             *([line("منها خصم لاحق خُفّضت به تكلفة المخزون", dsc["stock"])] if dsc["stock"] > 0.005 else []),
             line("قيمة المخزون الحالية (بالتكلفة)", stock_value), sep,
             " إقرار ضريبة القيمة المضافة (15%):",
@@ -2293,7 +2651,7 @@ def build_item_card_pdf(path, item_code, item_name, rows, final_text):
     _simple_report_pdf(
         path,
         [f"كارت صنف / Item Movement Report: {item_name} ({item_code})"],
-        ["التاريخ", "نوع الحركة", "الطرف", "الكمية", "الرصيد", "السعر", "القيمة"],
+        ["التاريخ", "نوع الحركة", "الطرف", "الكمية", "الرصيد", "التكلفة", "القيمة بالتكلفة"],
         [r[:7] for r in rows], [62, 100, 110, 55, 65, 60, 70], [final_text])
 
 
@@ -2986,10 +3344,10 @@ def get_cash_opening():
     return head[0], amounts
 
 
-def set_cash_opening(as_of, amounts):
+def set_cash_opening(as_of, amounts, conn=None):
     """الأرصدة الافتتاحية للخزينة والبنوك كقيد واحد: من ح/ النقدية والبنوك إلى ح/ وسيط افتتاحي (99999).
-    إعادة الحفظ تستبدل القيد السابق، والسالب (سحب على المكشوف) يُرحَّل دائناً."""
-    with db() as conn:
+    إعادة الحفظ تستبدل القيد السابق، والسالب (سحب على المكشوف) يُرحَّل دائناً. conn: معاملة مفتوحة (مثل الاستيراد)."""
+    with (nullcontext(conn) if conn is not None else db()) as conn:
         accounts = cash_accounts(conn)
         old = conn.execute("SELECT value FROM app_settings WHERE key=?", (CASH_OPENING_SETTING,)).fetchone()
         if old and old[0]:
@@ -4155,6 +4513,183 @@ def discount_invoice_choices(kind, party_code):
             (kind, party_code)).fetchall()
 
 
+HW_SOURCE = "HansaWorld"
+
+
+def hw_cogs(conn, d_from, d_to, by_month=False):
+    """تكلفة مبيعات الفترة التاريخية المستوردة من HansaWorld بطريقة الجرد الدوري، لأن فواتيرها بالإجمالي بلا بنود أصناف
+    (فلا توجد تكلفة صنف لكل بيعة):
+        تكلفة المبيعات = مشتريات HansaWorld − إشعارات خصم الموردين المستوردة − المخزون الختامي في تاريخ الترحيل
+    (مخزون أول مدة HansaWorld = صفر لأن الملفات تبدأ من الصفر). المخزون الختامي = الرصيد الافتتاحي للأصناف في النظام
+    ويُطرح في الفترة/الشهر الذي يقع فيه تاريخ الترحيل. إشعارات الموردين المستوردة تدخل هنا (تسوية مشتريات) فتُستبعد من
+    «الخصم المكتسب» في الإيرادات الأخرى حتى لا تُحسب مرتين.
+    يرجع {مفتاح الشهر أو '': dict(purchases, credits, closing, cogs)} — فارغ لو لم يُستورد شيء من HansaWorld."""
+    out = defaultdict(lambda: dict(purchases=0.0, credits=0.0, closing=0.0, ref_adj=0.0, cogs=0.0))
+    try:
+        cutover = conn.execute("SELECT MAX(doc_date) FROM hw_import_map WHERE role IN ('customer','supplier')").fetchone()[0]
+    except sqlite3.OperationalError:
+        return out
+    if not cutover:
+        return out
+    key = "substr({},1,7)" if by_month else "''"
+    for k, v in conn.execute(f"SELECT {key.format('purchase_date')}, SUM(subtotal) FROM purchase_invoices "
+                             f"WHERE source_type=? AND purchase_date BETWEEN ? AND ? GROUP BY 1", (HW_SOURCE, d_from, d_to)):
+        out[k]["purchases"] += v or 0.0
+    for k, v in conn.execute(f"SELECT {key.format('discount_date')}, SUM(subtotal) FROM post_discounts WHERE kind='purchase' "
+                             f"AND discount_date BETWEEN ? AND ? AND discount_id IN (SELECT target_id FROM hw_import_map "
+                             f"WHERE role='supplier' AND target='post_discounts') GROUP BY 1", (d_from, d_to)):
+        out[k]["credits"] += v or 0.0
+    if d_from <= cutover <= d_to:
+        (closing,) = conn.execute("SELECT COALESCE(SUM(opening_qty * opening_cost), 0) FROM inventory").fetchone()
+        out[cutover[:7] if by_month else ""]["closing"] += closing or 0.0
+    for a in hw_cogs_ref_adjustments(conn):
+        if d_from <= a["date"] <= d_to and abs(a["adj"]) > 0.005:
+            out[a["date"][:7] if by_month else ""]["ref_adj"] += a["adj"]
+    for o in out.values():
+        o["cogs"] = round(o["purchases"] - o["credits"] - o["closing"] + o["ref_adj"], 2)
+    return out
+
+
+# ============================================================
+# المراجع المحاسبية من HansaWorld (ميزان المراجعة + قوائم الدخل لفترات) — تقسيم فترة HansaWorld إلى فترات مرجعية
+# ============================================================
+HW_COGS_PREFIXES = ("4111", "412")   # تكلفة المبيعات 41110 ومردود/فروق المشتريات 41201 في دفتر HansaWorld
+HW_SALES_PREFIX, HW_OTHER_REV_PREFIX = "31", "33"
+
+
+def _safe_rows(conn, sql, params=()):
+    try:
+        return conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def _shift_day(d, days):
+    return (datetime.strptime(d, "%Y-%m-%d").date() + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def hw_ref_segments(conn):
+    """فترات HansaWorld المرجعية لحسابات قائمة الدخل (3xxxx/4xxxx/5xxxx):
+    - ميزان المراجعة التحليلي = تراكمي من أول مستند HansaWorld حتى تاريخ الميزان.
+    - كل قائمة دخل مستوردة لفترة (مثل 2026-01-01 → 2026-11-19) = فترة بأرقامها كما هي.
+    - الباقي (الميزان − مجموع القوائم) = الفترة غير المغطاة (مثل 2025-07-31 → 2025-12-31).
+    يرجع [dict(d_from, d_to, src: tb|pl|tb_rest, amounts={الكود: (الاسم، المبلغ مدين موجب)})] مرتبة، أو [] بلا ميزان."""
+    tb = [r for r in _safe_rows(conn, "SELECT account_code, account_name, balance, as_of FROM hw_tb_reference")
+          if str(r[0])[:1] in ("3", "4", "5")]
+    if not tb:
+        return []
+    tb_to = max((r[3] or "" for r in tb), default="") or today()
+    first = _safe_rows(conn, "SELECT MIN(doc_date) FROM hw_import_map WHERE role IN ('customer','supplier')")
+    tb_from = min((first[0][0] if first and first[0][0] else None) or "1900-01-01", tb_to)
+    pl = defaultdict(dict)
+    for f, t, code, name, amt in _safe_rows(conn, "SELECT period_from, period_to, account_code, account_name, amount "
+                                                  "FROM hw_pl_reference"):
+        pl[(f, t)][code] = (name, round(amt or 0.0, 2))
+    segs = [dict(d_from=f, d_to=t, src="pl", amounts=acc) for (f, t), acc in sorted(pl.items())]
+    rest = {code: (name, round(bal or 0.0, 2)) for code, name, bal, _ in tb}
+    for sg in segs:
+        for code, (name, amt) in sg["amounts"].items():
+            n0, b0 = rest.get(code, (name, 0.0))
+            rest[code] = (n0, round(b0 - amt, 2))
+    gaps, cur = [], tb_from
+    for sg in segs:
+        if sg["d_from"] > cur:
+            gaps.append((cur, _shift_day(sg["d_from"], -1)))
+        cur = max(cur, _shift_day(sg["d_to"], 1))
+    if cur <= tb_to:
+        gaps.append((cur, tb_to))
+    if gaps:   # باقي الميزان يُنسب لأول فترة غير مغطاة (الحالة المعتادة: فترة واحدة قبل أول قائمة دخل)
+        segs.append(dict(d_from=gaps[0][0], d_to=gaps[0][1], src="tb_rest" if pl else "tb",
+                         amounts={c: v for c, v in rest.items() if abs(v[1]) > 0.005 or not pl}))
+    return sorted(segs, key=lambda x: x["d_from"])
+
+
+def hw_segment_totals(amounts):
+    """تجميع حسابات فترة مرجعية بمفاهيم قائمة الدخل (موجبة): المبيعات، الإيرادات الأخرى، تكلفة المبيعات،
+    المصروفات البيعية (43)، الإدارية (5)، أخرى (41125 وغيرها)، مجمل الربح وصافي الربح."""
+    t = dict(sales=0.0, other_income=0.0, cogs=0.0, selling=0.0, admin=0.0, other_exp=0.0)
+    for code, (_, amt) in amounts.items():
+        if code.startswith(HW_SALES_PREFIX):
+            t["sales"] -= amt
+        elif code.startswith("3"):
+            t["other_income"] -= amt
+        elif code.startswith(HW_COGS_PREFIXES):
+            t["cogs"] += amt
+        elif code.startswith("43"):
+            t["selling"] += amt
+        elif code.startswith("5"):
+            t["admin"] += amt
+        elif code.startswith("4"):
+            t["other_exp"] += amt
+    t = {k: round(v, 2) for k, v in t.items()}
+    t["opex"] = round(t["selling"] + t["admin"] + t["other_exp"], 2)
+    t["gross"] = round(t["sales"] - t["cogs"], 2)
+    t["net_profit"] = round(t["gross"] + t["other_income"] - t["opex"], 2)
+    return t
+
+
+def hw_cogs_ref_adjustments(conn):
+    """تسوية تكلفة مبيعات كل فترة مرجعية من HansaWorld لتساوي دفتر HansaWorld (41110 + 41201):
+    التسوية = تكلفة الدفتر للفترة − تكلفة الجرد الدوري للفترة (مشتريات − إشعارات موردين − المخزون الختامي إن وقع فيها)،
+    وتُسجَّل في آخر يوم من الفترة. سببها: الجرد الدوري لا يعرف مخزون بداية الفترة الوسيطة (مثل 2026-01-01)
+    ولا البضاعة المستلمة غير المفوترة (مشتريات مستحقة 22380) ولا فروق مردودات المشتريات.
+    يرجع [] لو الميزان لا يحتوي حسابات تكلفة المبيعات أو كان تاريخ الترحيل بعد آخر فترة مرجعية."""
+    segs = hw_ref_segments(conn)
+    if not segs or not any(c.startswith(HW_COGS_PREFIXES) for sg in segs for c in sg["amounts"]):
+        return []
+    row = _safe_rows(conn, "SELECT MAX(doc_date) FROM hw_import_map WHERE role IN ('customer','supplier')")
+    cutover = row[0][0] if row else None
+    if not cutover or cutover > segs[-1]["d_to"]:
+        return []
+    (closing,) = conn.execute("SELECT COALESCE(SUM(opening_qty * opening_cost), 0) FROM inventory").fetchone()
+    out = []
+    for i, sg in enumerate(segs):
+        a, b = ("0000-01-01" if i == 0 else sg["d_from"]), sg["d_to"]
+        (pur,) = conn.execute("SELECT COALESCE(SUM(subtotal),0) FROM purchase_invoices WHERE source_type=? "
+                              "AND purchase_date BETWEEN ? AND ?", (HW_SOURCE, a, b)).fetchone()
+        (cr,) = conn.execute("SELECT COALESCE(SUM(subtotal),0) FROM post_discounts WHERE kind='purchase' AND discount_date "
+                             "BETWEEN ? AND ? AND discount_id IN (SELECT target_id FROM hw_import_map WHERE role='supplier' "
+                             "AND target='post_discounts')", (a, b)).fetchone()
+        cl = (closing or 0.0) if a <= cutover <= b else 0.0
+        ref = round(sum(amt for c, (_, amt) in sg["amounts"].items() if c.startswith(HW_COGS_PREFIXES)), 2)
+        periodic = round(pur - cr - cl, 2)
+        out.append(dict(seg=sg, date=b, ref=ref, periodic=periodic, purchases=round(pur, 2), credits=round(cr, 2),
+                        closing=round(cl, 2), adj=round(ref - periodic, 2)))
+    return out
+
+
+# ============================================================
+# تصنيف المصروفات التشغيلية: بيعية وتسويقية (43) / إدارية وعمومية (5 وسندات المصروفات العامة) / أخرى (41125 …)
+# ============================================================
+OPEX_GROUP_LABELS = {"selling": "مصروفات بيعية وتسويقية", "admin": "مصروفات إدارية وعمومية",
+                     "other": "مصروفات أخرى (إيجار سيارات وغيرها)"}
+
+
+def opex_group_of(code):
+    code = str(code or "")
+    if code.startswith("43"):
+        return "selling"
+    if code.startswith("4") and not code.startswith("40"):
+        return "other"
+    return "admin"
+
+
+def expense_groups(conn, d_from, d_to):
+    """{selling, admin, other}: نفس مصادر expense_breakdown (سندات الصرف + القيود) مصنفة بكود الحساب."""
+    from . import ledger
+    out = dict(selling=0.0, admin=0.0, other=0.0)
+    chart = {c for (c,) in conn.execute("SELECT account_code FROM chart_of_accounts")}
+    for code, name, amt in conn.execute(
+            "SELECT party_code, party_name, SUM(amount) FROM cash_transactions WHERE trans_type='صرف' AND category=? "
+            "AND trans_date BETWEEN ? AND ? GROUP BY party_code, party_name", (CAT_EXPENSE, d_from, d_to)):
+        acc = code if code in chart else ledger._expense_by_name(conn, name)
+        out[opex_group_of(acc)] += amt or 0.0
+    for _, typ, code, _, amt in journal_pl(conn, d_from, d_to):
+        if typ == TYPE_EXP:
+            out[opex_group_of(code)] += amt
+    return out
+
+
 def discount_totals(conn, d_from, d_to, by_month=False):
     """أثر الخصومات اللاحقة على قائمة الدخل والضريبة: {مفتاح الشهر أو '': dict(...)}.
     sales_sub/sales_vat = إشعارات العملاء (تخفض صافي المبيعات وضريبة المخرجات).
@@ -4241,7 +4776,8 @@ CREATE TABLE IF NOT EXISTS attachments (
     data BLOB NOT NULL,
     notes TEXT,
     uploaded_by TEXT,
-    uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP
+    uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    file_path TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_attach_doc ON attachments(doc_type, doc_id);
 -- تسوية الدفعات المقدمة / تحت الحساب مع الفواتير اللاحقة (مطابقة فقط: لا قيد جديد، الطرف نفسه في نفس حساب الذمم)
@@ -4563,13 +5099,57 @@ def rep_rep_performance(p):
     return Report("أداء المناديب (مبيعات، مشتريات، تحصيلات)", cols, rows, total, notes, f"من {a} إلى {b}", chart=(0, 3))
 
 
-# ---------------------------------------------------------- المرفقات (فواتير الموردين الأصلية، مستندات القيود)
+# ---------------------------------------------------------- المرفقات (فواتير الموردين، مستندات القيود، سندات القبض والصرف)
+# الملف نفسه في مجلد المرفقات ATTACH_DIR/<نوع المستند>/<رقمه>/<معرّف>_<الاسم> (خارج git)، والقاعدة تحفظ بياناته ومساره.
+# المرفقات القديمة المحفوظة داخل القاعدة (data) تُقرأ كما هي. الحذف لا يتلف الملفات: تُنقل إلى ATTACH_DIR/_deleted/.
 ATTACH_MAX_MB = 10
 ATTACH_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".heic", ".xlsx", ".xls",
                ".csv", ".doc", ".docx", ".txt")
 ATTACH_DOCS = {"purchase": ("purchase_invoices", "purchase_id", "فاتورة مشتريات"),
                "receipt": ("purchase_receipts", "receipt_id", "إذن استلام (فاتورة المورد)"),
-               "journal": ("journal_entries", "entry_id", "قيد يومية")}
+               "journal": ("journal_entries", "entry_id", "قيد يومية"),
+               "voucher": ("cash_transactions", "trans_id", "سند قبض / صرف")}
+# صلاحيات الرفع لكل نوع (يكفي واحدة منها)
+ATTACH_PERMS = {"receipt": ("purchase.receipt_create",), "voucher": ("cash.receipt", "cash.payment", "cash.register")}
+
+
+def _attach_abs(rel):
+    return os.path.join(ATTACH_DIR, *str(rel).split("/"))
+
+
+def _safe_file_name(name):
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    return name[:120] or "file"
+
+
+def _archive_attachment_files(rels, tag):
+    """نقل ملفات مرفقات محذوفة إلى ATTACH_DIR/_deleted/<tag>/ بدل حذفها (لا تُتلف أي بيانات)."""
+    for rel in rels:
+        if not rel:
+            continue
+        src = _attach_abs(rel)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(ATTACH_DIR, "_deleted", tag, *str(rel).split("/"))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.exists(dst):
+            dst = f"{dst}.{datetime.now():%H%M%S%f}"
+        os.replace(src, dst)
+
+
+def _find_archived(rel):
+    """ملف نُقل للأرشيف ثم أُلغيت عملية الحذف (تراجع المعاملة): يُعاد لمكانه."""
+    root = os.path.join(ATTACH_DIR, "_deleted")
+    if not os.path.isdir(root):
+        return None
+    for tag in sorted(os.listdir(root), reverse=True):
+        cand = os.path.join(root, tag, *str(rel).split("/"))
+        if os.path.exists(cand):
+            dst = _attach_abs(rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.replace(cand, dst)
+            return dst
+    return None
 
 
 def add_attachment(doc_type, doc_id, file_name, data, user="", notes=""):
@@ -4583,16 +5163,30 @@ def add_attachment(doc_type, doc_id, file_name, data, user="", notes=""):
         raise UserError("نوع الملف غير مدعوم. المسموح: PDF والصور (JPG/PNG...) وملفات Excel/Word/CSV/TXT.")
     if len(data) > ATTACH_MAX_MB * 1024 * 1024:
         raise UserError(f"حجم الملف أكبر من {ATTACH_MAX_MB} ميجابايت.")
-    if doc_type == "receipt":
-        require_perm("purchase.receipt_create", "إرفاق فاتورة المورد على استلام المخزن")
     table, idcol, label = ATTACH_DOCS[doc_type]
+    keys = ATTACH_PERMS.get(doc_type)
+    if keys:
+        u = _CURRENT_PERMS.get()
+        if u is not None and not any(user_can(u, k) for k in keys):
+            require_perm(keys[0], f"إرفاق مستند على {label}")
+    import uuid
+    rel = f"{doc_type}/{int(doc_id)}/{uuid.uuid4().hex[:12]}_{_safe_file_name(file_name)}"
     with db() as conn:
         if conn.execute(f"SELECT 1 FROM {table} WHERE {idcol}=?", (doc_id,)).fetchone() is None:
             raise UserError(f"{label} غير موجود.")
-        return conn.execute("INSERT INTO attachments (doc_type, doc_id, file_name, mime, size, data, notes, uploaded_by) "
-                            "VALUES (?,?,?,?,?,?,?,?)",
-                            (doc_type, int(doc_id), file_name, mimetypes.guess_type(file_name)[0] or "application/octet-stream",
-                             len(data), sqlite3.Binary(data), notes, user)).lastrowid
+        path = _attach_abs(rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        try:
+            return conn.execute("INSERT INTO attachments (doc_type, doc_id, file_name, mime, size, data, notes, uploaded_by, "
+                                "file_path) VALUES (?,?,?,?,?,?,?,?,?)",
+                                (doc_type, int(doc_id), file_name,
+                                 mimetypes.guess_type(file_name)[0] or "application/octet-stream", len(data),
+                                 sqlite3.Binary(b""), notes, user, rel)).lastrowid
+        except Exception:
+            os.remove(path)
+            raise
 
 
 def list_attachments(doc_type, doc_id):
@@ -4610,15 +5204,27 @@ def list_attachments(doc_type, doc_id):
 
 def get_attachment(attach_id):
     with db() as conn:
-        r = conn.execute("SELECT file_name, mime, data FROM attachments WHERE attach_id=?", (attach_id,)).fetchone()
+        r = conn.execute("SELECT file_name, mime, data, file_path FROM attachments WHERE attach_id=?",
+                         (attach_id,)).fetchone()
     if r is None:
         raise UserError("المرفق غير موجود.")
-    return r[0], r[1], bytes(r[2])
+    if r[3]:
+        path = _attach_abs(r[3])
+        if not os.path.exists(path):
+            path = _find_archived(r[3])
+        if not path:
+            raise UserError(f"ملف المرفق غير موجود في مجلد المرفقات:\n{_attach_abs(r[3])}")
+        with open(path, "rb") as fh:
+            return r[0], r[1], fh.read()
+    return r[0], r[1], bytes(r[2] or b"")
 
 
 def delete_attachment(attach_id):
     with db() as conn:
+        r = conn.execute("SELECT file_path FROM attachments WHERE attach_id=?", (attach_id,)).fetchone()
         conn.execute("DELETE FROM attachments WHERE attach_id=?", (attach_id,))
+    if r:
+        _archive_attachment_files([r[0]], f"{datetime.now():%Y%m%d_%H%M%S}")
 
 
 def attachment_counts(doc_type):
@@ -4633,7 +5239,9 @@ def attachment_counts(doc_type):
 
 
 def _delete_doc_attachments(conn, doc_type, doc_id):
+    rels = [p for (p,) in conn.execute("SELECT file_path FROM attachments WHERE doc_type=? AND doc_id=?", (doc_type, doc_id))]
     conn.execute("DELETE FROM attachments WHERE doc_type=? AND doc_id=?", (doc_type, doc_id))
+    _archive_attachment_files(rels, f"{datetime.now():%Y%m%d_%H%M%S}")
 
 
 # ============================================================
@@ -4690,7 +5298,7 @@ def list_partners(role, q=""):
         rows = conn.execute(f"SELECT partner_code, name, COALESCE(phone,''), COALESCE(vat_number,''), COALESCE(rep_name,''), "
                             f"COALESCE(opening_debit,0) - COALESCE(opening_credit,0), COALESCE(legacy_code,''), "
                             f"COALESCE(address,''), COALESCE(cr_number,''), COALESCE(email,'') "
-                            f"FROM business_partners WHERE {flag}=1 ORDER BY name").fetchall()
+                            f"FROM business_partners WHERE {flag}=1 AND {ACTIVE_PARTNER_SQL} ORDER BY name").fetchall()
         links = partner_link_map(conn)
     if q:
         nq = search_norm(q)
@@ -4700,7 +5308,8 @@ def list_partners(role, q=""):
 
 def partner_link_map(conn):
     """{الكود: [كل أكواد نفس الكيان]} بمطابقة الاسم الموحد أو الرقم الضريبي (15 رقماً) بين الشجرتين."""
-    rows = conn.execute("SELECT partner_code, name, COALESCE(vat_number,'') FROM business_partners").fetchall()
+    rows = conn.execute("SELECT partner_code, name, COALESCE(vat_number,'') FROM business_partners "
+                        f"WHERE {ACTIVE_PARTNER_SQL}").fetchall()
     groups = {}
     parent = {c: c for c, _, _ in rows}
 
@@ -5183,6 +5792,11 @@ def journal_entry_source(conn, entry_id):
 
 def _block_system_entry(conn, entry_id):
     src = journal_entry_source(conn, entry_id)
+    if src and src[0] in ("hw_tb_expenses", "hw_cogs_closing"):
+        what = ("«تجميع فترة من ميزان HansaWorld» لأرصدة المصاريف" if src[0] == "hw_tb_expenses"
+                else "«تسوية تكلفة مبيعات فترة HansaWorld بالمخزون الختامي»")
+        raise UserError(f"هذا قيد نظام {what}.\n"
+                        "يُعاد بناؤه أو يُلغى من مركز الاستيراد ← استيراد HansaWorld فقط.")
     if src:
         raise UserError("هذا قيد آلي ينشئه النظام من مستند (إشعار خصم لاحق) ويُحدَّث معه تلقائياً.\n"
                         "لتعديله أو حذفه عدّل/احذف الإشعار نفسه من تبويب «الخصم اللاحق».")
@@ -5208,6 +5822,7 @@ def delete_voucher(trans_id):
                               (trans_id,)).fetchall()
         conn.execute("DELETE FROM advance_allocations WHERE trans_id=?", (trans_id,))
         conn.execute("DELETE FROM cash_transactions WHERE trans_id=?", (trans_id,))
+        _delete_doc_attachments(conn, "voucher", trans_id)
         if r[0] in ("sales", "purchase") and r[1]:
             refresh_invoice_paid(conn, r[0], r[1])
         for k_, i_ in linked:   # الفواتير التي سُوّيت من هذه الدفعة تعود مفتوحة بقيمتها
@@ -5237,9 +5852,8 @@ def find_invoice_id(kind, number):
     return r[0] if r else None
 
 
-def save_voucher(t_type, t_date, account_bank, category, party, amount, alloc=None, description=""):
-    """تسجيل سند قبض/صرف (منقول من شاشة الخزينة إلى المحرك). party = (الكود، الاسم)، alloc = (sales|purchase، رقم الفاتورة).
-    التحقق: نوع السند يناسب الفاتورة، الفاتورة تخص الطرف ومفتوحة، والمبلغ لا يتجاوز المتبقي بعد الخصومات اللاحقة."""
+def check_voucher_header(t_type, t_date, category, party, amount):
+    """تحقق رأس السند المشترك بين السند العادي والسند الموزّع على عدة فواتير. يرجع المبلغ مقرباً لهللتين."""
     if t_type not in ("قبض", "صرف"):
         raise UserError("نوع السند غير صحيح.")
     require_perm("cash.receipt" if t_type == "قبض" else "cash.payment", f"سند {t_type}")
@@ -5251,11 +5865,17 @@ def save_voucher(t_type, t_date, account_bank, category, party, amount, alloc=No
         raise UserError("اختر الشريك / الحساب من القائمة.")
     if amount is None or amount <= 0:
         raise UserError("أدخل مبلغاً صحيحاً أكبر من الصفر.")
-    amount = round(amount, 2)
     if category in (CAT_EXPENSE, CAT_ASSET) and t_type == "قبض":
         raise UserError("المصروفات والأصول الثابتة تُسجّل بسند صرف فقط.")
     if category == CAT_EMPLOYEE and not party[0]:
         raise UserError("اختر حساب العامل من القائمة (حسابات ذمم/عهد العاملين).")
+    return round(amount, 2)
+
+
+def save_voucher(t_type, t_date, account_bank, category, party, amount, alloc=None, description=""):
+    """تسجيل سند قبض/صرف (منقول من شاشة الخزينة إلى المحرك). party = (الكود، الاسم)، alloc = (sales|purchase، رقم الفاتورة).
+    التحقق: نوع السند يناسب الفاتورة، الفاتورة تخص الطرف ومفتوحة، والمبلغ لا يتجاوز المتبقي بعد الخصومات اللاحقة."""
+    amount = check_voucher_header(t_type, t_date, category, party, amount)
     with db() as conn:
         alloc_type = alloc_id = None
         if alloc and category == CAT_PARTNER:
@@ -5347,8 +5967,8 @@ def integrity_check():
                 [r[0] for r in q(f"SELECT COALESCE(h.invoice_no, h.{c['iid']}) FROM {c['inv']} h LEFT JOIN "
                                  f"(SELECT {c['iid']} k, SUM(subtotal) s, SUM(vat_amount) v, SUM(total_amount) t FROM {c['ilines']} "
                                  f"GROUP BY {c['iid']}) l ON l.k=h.{c['iid']} "
-                                 f"WHERE ABS(h.subtotal-COALESCE(l.s,0))>0.05 OR ABS(h.vat_amount-COALESCE(l.v,0))>0.05 "
-                                 f"OR ABS(h.total_amount-COALESCE(l.t,0))>0.05")])
+                                 f"WHERE COALESCE(h.source_type,'') != 'HansaWorld' AND (ABS(h.subtotal-COALESCE(l.s,0))>0.05 "
+                                 f"OR ABS(h.vat_amount-COALESCE(l.v,0))>0.05 OR ABS(h.total_amount-COALESCE(l.t,0))>0.05)")])
             add("خطأ", f"فواتير {label}", "ضريبة البند لا تساوي 15% من قيمته",
                 [r[0] for r in q(f"SELECT DISTINCT {c['iid']} FROM {c['ilines']} "
                                  f"WHERE ABS(vat_amount - ROUND(subtotal*{VAT_RATE},2)) > 0.011")])
@@ -5362,8 +5982,10 @@ def integrity_check():
                                  f"(SELECT COALESCE(SUM(total_amount),0) FROM post_discounts WHERE kind=? AND invoice_id=h.{c['iid']})"
                                  f" > h.total_amount + 0.01", (kind,))])
             add("خطأ", f"فواتير {label}", "فاتورة بدون أي بند",
+                # فواتير HansaWorld التاريخية مستوردة بالإجمالي فقط (الأصناف في سجل حركات الأصناف المستوردة)
                 [r[0] for r in q(f"SELECT COALESCE(invoice_no, {c['iid']}) FROM {c['inv']} h WHERE NOT EXISTS "
-                                 f"(SELECT 1 FROM {c['ilines']} l WHERE l.{c['iid']}=h.{c['iid']})")])
+                                 f"(SELECT 1 FROM {c['ilines']} l WHERE l.{c['iid']}=h.{c['iid']}) "
+                                 f"AND COALESCE(h.source_type,'') != 'HansaWorld'")])
             add("خطأ", f"أوامر {label}", "الكمية المنفذة أو المفوترة تتجاوز كمية الأمر",
                 [r[0] for r in q(f"SELECT DISTINCT order_id FROM {c['olines']} WHERE {c['done']} > quantity + {EPS} "
                                  f"OR invoiced_qty > {c['done']} + {EPS}")])
@@ -5479,6 +6101,8 @@ class Report:
         self.total, self.notes, self.subtitle, self.chart = total, notes or [], subtitle, chart
         # highlight: فهارس أعمدة تُميَّز بلون أصفر (العرض والتصدير). ltr: ترتيب الأعمدة من اليسار (تقارير بعناوين إنجليزية)
         self.highlight, self.ltr = tuple(highlight), ltr
+        # row_styles: {فهرس السطر: group (رأس طرف) | sub (إجمالي فرعي) | shared (طرف مشترك) | net (صافي مقاصة)}
+        self.row_styles = {}
 
 
 def fmt_cell(v, kind):
@@ -5533,8 +6157,9 @@ def _pct(a, b):
     return (a / b * 100) if b else 0.0
 
 
-def partner_balances(as_of):
-    """أرصدة كل شريك حتى تاريخ معين. الرصيد = مدين - دائن (الموجب = ذمة مدينة على الطرف)."""
+def partner_balances(as_of, conn=None):
+    """أرصدة كل شريك حتى تاريخ معين. الرصيد = مدين - دائن (الموجب = ذمة مدينة على الطرف).
+    conn: اتصال مفتوح (مثل معاملة استيراد لم تُحفظ بعد) بدلاً من اتصال جديد."""
     comp = defaultdict(dict)
     queries = [
         ("sales", "SELECT customer_code, SUM(total_amount) FROM sales_invoices WHERE invoice_date<=? GROUP BY customer_code"),
@@ -5552,7 +6177,7 @@ def partner_balances(as_of):
         ("disc_s", "SELECT party_code, SUM(total_amount) FROM post_discounts WHERE kind='sales' AND discount_date<=? "
                    "GROUP BY party_code"),
     ]
-    with db() as conn:
+    with (nullcontext(conn) if conn is not None else db()) as conn:
         for key, sql in queries:
             for code, v in conn.execute(sql, (as_of,)):
                 comp[code][key] = v or 0.0
@@ -5603,6 +6228,230 @@ def rep_payables(p):
     total = ("", "الإجمالي", "", *[sum(r[i] for r in rows) for i in range(3, 8)], tot, None, None)
     notes = [f"عدد الموردين الدائنين: {len(rows)}   |   إجمالي الذمم الدائنة: {fmt(tot)} ر.س"]
     return Report("الذمم الدائنة / أرصدة الموردين", cols, rows, total, notes, f"الرصيد حتى {p['d_to']}", chart=(1, 8))
+
+
+# ---------------------------------------------------------- تقارير العملاء والموردين: إجماليات / تفاصيل مجمّعة / مقاصة
+PT_MODES = {"summary": "إجماليات", "detail": "تفاصيل مجمّعة"}
+PT_DETAIL_COLS = [("الكود", "t"), ("الاسم", "t"), ("التاريخ", "t"), ("رقم المستند", "t"), ("نوع الحركة", "t"),
+                  ("البيان", "t"), ("مدين (عليه)", "m"), ("دائن (له)", "m"), ("الرصيد", "m")]
+
+
+def _pt_opts(p):
+    mode = p.get("mode") or "summary"
+    if mode not in PT_MODES:
+        raise UserError("وضع التقرير غير معروف (إجماليات أو تفاصيل).")
+    return mode, bool(p.get("nonzero")), bool(p.get("shared_only"))
+
+
+def _pt_parties(conn):
+    """{الكود: (الاسم، عميل؟، مورد؟، الهاتف، الرقم الضريبي)} للأطراف الظاهرة (بدون الأكواد القديمة المؤرشفة)."""
+    return {r[0]: r[1:] for r in conn.execute(
+        "SELECT partner_code, name, is_customer, is_supplier, COALESCE(phone,''), COALESCE(vat_number,'') "
+        f"FROM business_partners WHERE {ACTIVE_PARTNER_SQL} ORDER BY partner_code")}
+
+
+def shared_partners(conn, parts=None):
+    """الأطراف المشتركة بين العملاء والموردين: {الكود: (أكواد الطرف الآخر، السبب)}.
+    السبب: «نفس الكود» (كود واحد عميل ومورد معاً) أو «نفس الاسم» أو «نفس الرقم الضريبي» (كودان مرتبطان)."""
+    parts = parts if parts is not None else _pt_parties(conn)
+    links = partner_link_map(conn)
+    out = {}
+    for code, (name, is_c, is_s, _ph, vat) in parts.items():
+        group = [c for c in links.get(code, [code]) if c in parts]
+        others = [c for c in group if c != code and (parts[c][2] if is_c else parts[c][1])]
+        if is_c and is_s:
+            out[code] = (others, "نفس الكود")
+        elif others:
+            same_name = any(norm_name(parts[c][0]) == norm_name(name) for c in others)
+            out[code] = (others, "نفس الاسم" if same_name else "نفس الرقم الضريبي")
+    return out
+
+
+def _pt_side_entries(conn, code, side_of_b):
+    """حركات كود واحد مقسومة: {'c': حركات كعميل، 's': حركات كمورد}. الحركة المشتركة (b) تذهب للجانب side_of_b."""
+    out = {"c": [], "s": []}
+    for e in _partner_entries(conn, [code]):
+        out[side_of_b if e[8] == "b" else e[8]].append(e)
+    for v in out.values():
+        v.sort(key=lambda e: (e[0] or "", e[1]))
+    return out
+
+
+def _pt_block(rows, styles, entries, d_from, d_to, code, name, sign=1, head=None, sub_label=None):
+    """يضيف حركات طرف (أو جانب منه) برصيد متحرك وإجمالي فرعي. sign=-1 لعرض رصيد المورد موجباً (له).
+    يرجع (رصيد سابق، مدين، دائن، الرصيد، عدد الحركات)."""
+    prior, inside = _split_period(entries, d_from, d_to)
+    if head:
+        styles[len(rows)] = "group"
+        rows.append((code, head, "", "", "", "", None, None, None))
+    bal = prior * sign
+    if abs(prior) > 0.005:
+        rows.append(("", "", d_from or "", "سابق", "رصيد ما قبل الفترة", f"مُرحَّل حتى {d_from}", None, None, bal))
+    deb = cred = 0.0
+    for d, _, ref, typ, desc, debit, credit, *_ in inside:
+        bal += (debit - credit) * sign
+        deb += debit
+        cred += credit
+        rows.append(("", "", d or "-", ref, typ, desc, debit or None, credit or None, round(bal, 2)))
+    styles[len(rows)] = "sub"
+    rows.append((code, sub_label or f"إجمالي {name}", "", "", f"{len(inside)} حركة", "", round(deb, 2), round(cred, 2),
+                 round(bal, 2)))
+    return prior * sign, deb, cred, round(bal, 2), len(inside)
+
+
+def _rep_party_role(p, role):
+    mode, nonzero, shared_only = _pt_opts(p)
+    who, many = ("العميل", "العملاء") if role == "customer" else ("المورد", "الموردين")
+    sign = 1 if role == "customer" else -1      # الرصيد الموجب: عليه للعميل، له للمورد
+    d_from, d_to = p.get("d_from"), p.get("d_to")
+    with db() as conn:
+        parts = _pt_parties(conn)
+        shared = shared_partners(conn, parts)
+        codes = [c for c, v in parts.items() if (v[1] if role == "customer" else v[2])]
+        if shared_only:
+            codes = [c for c in codes if c in shared]
+        side = "c" if role == "customer" else "s"
+        data = {c: _pt_side_entries(conn, c, side)[side] for c in codes}
+    period = period_label(d_from, d_to)
+    filt = (" • الأرصدة غير الصفرية فقط" if nonzero else "") + (" • الأطراف المشتركة فقط" if shared_only else "")
+    bal_name = "الرصيد (عليه)" if role == "customer" else "الرصيد (له)"
+    rows, styles = [], {}
+    if mode == "summary":
+        for code in codes:
+            prior, inside = _split_period(data[code], d_from, d_to)
+            deb = round(sum(e[5] for e in inside), 2)
+            cred = round(sum(e[6] for e in inside), 2)
+            bal = round((prior + deb - cred) * sign, 2)
+            if not inside and abs(prior) < 0.005 or nonzero and abs(bal) < 0.005:
+                continue
+            sh = shared.get(code)
+            if sh:
+                styles[len(rows)] = "shared"
+            rows.append((code, parts[code][0], parts[code][3] or "-", round(prior * sign, 2), deb, cred, bal,
+                         "مدين (عليه)" if bal * sign > 0.005 else ("دائن (له)" if bal * sign < -0.005 else "-"), len(inside),
+                         max((e[0] or "" for e in inside), default="") or "-",
+                         f"{sh[1]}: {' ، '.join(sh[0]) or code}" if sh else ""))
+        cols = [("الكود", "t"), (who, "t"), ("الهاتف", "t"), ("رصيد سابق", "m"), ("مدين الفترة", "m"), ("دائن الفترة", "m"),
+                (bal_name, "m"), ("الحالة", "t"), ("عدد الحركات", "i"), ("آخر حركة", "t"), ("مشترك مع", "t")]
+        total = ("", "الإجمالي", "", *[round(sum(r[i] for r in rows), 2) for i in (3, 4, 5, 6)], "",
+                 sum(r[8] for r in rows), "", "")
+        notes = [f"عدد {many}: {len(rows)}   |   صافي الأرصدة: {fmt(total[6])} ر.س" + filt,
+                 "«مشترك مع» = نفس الكيان عميل ومورد (نفس الكود أو مرتبط بالاسم/الرقم الضريبي) — راجع تقرير المقاصة."]
+        rep = Report(f"تقرير {many} — إجماليات", cols, rows, total, notes, period)
+    else:
+        tot = [0.0, 0.0, 0.0, 0]
+        for code in codes:
+            prior, inside = _split_period(data[code], d_from, d_to)
+            bal = (prior + sum(e[5] - e[6] for e in inside)) * sign
+            if not inside and abs(prior) < 0.005 or nonzero and abs(bal) < 0.005:
+                continue
+            sh = shared.get(code)
+            head = parts[code][0] + (f"   ⇄ مشترك ({sh[1]}: {' ، '.join(sh[0]) or code})" if sh else "")
+            _, deb, cred, bal, n = _pt_block(rows, styles, data[code], d_from, d_to, code, parts[code][0], sign, head=head)
+            tot[0] += deb
+            tot[1] += cred
+            tot[2] += bal
+            tot[3] += 1
+        cols = PT_DETAIL_COLS[:-1] + [(bal_name, "m")]
+        total = ("", f"الإجمالي العام ({tot[3]} {who if tot[3] == 1 else many})", "", "", "", "", round(tot[0], 2),
+                 round(tot[1], 2), round(tot[2], 2))
+        notes = [f"كل {who} بكل حركاته ثم إجمالي فرعي، ثم الإجمالي العام." + filt,
+                 "الرصيد متحرك داخل كل طرف ويبدأ من رصيد ما قبل الفترة."]
+        rep = Report(f"تقرير {many} — تفاصيل مجمّعة", cols, rows, total, notes, period)
+    rep.row_styles = styles
+    return rep
+
+
+def rep_customers_report(p):
+    return _rep_party_role(p, "customer")
+
+
+def rep_suppliers_report(p):
+    return _rep_party_role(p, "supplier")
+
+
+def rep_partner_netting(p):
+    """العملاء والموردون معاً للمقاصة: لكل كيان رصيده كعميل (عليه) ورصيده كمورد (له) وصافي المقاصة."""
+    mode, nonzero, shared_only = _pt_opts(p)
+    d_from, d_to = p.get("d_from"), p.get("d_to")
+    with db() as conn:
+        parts = _pt_parties(conn)
+        shared = shared_partners(conn, parts)
+        links = partner_link_map(conn)
+        groups, seen = [], set()
+        for code in parts:
+            if code in seen:
+                continue
+            g = [c for c in links.get(code, [code]) if c in parts]
+            seen.update(g)
+            groups.append(g)
+        sides = {c: _pt_side_entries(conn, c, "c" if parts[c][1] else "s") for c in parts}
+    period = period_label(d_from, d_to)
+    filt = (" • الأرصدة غير الصفرية فقط" if nonzero else "") + (" • الأطراف المشتركة فقط" if shared_only else "")
+    items = []
+    for g in groups:
+        reason = next((shared[c][1] for c in g if c in shared), "")
+        if shared_only and not reason:
+            continue
+        c_codes = [c for c in g if parts[c][1]]
+        s_codes = [c for c in g if parts[c][2]]
+        c_ent = sorted((e for c in g for e in sides[c]["c"]), key=lambda e: (e[0] or "", e[1]))
+        s_ent = sorted((e for c in g for e in sides[c]["s"]), key=lambda e: (e[0] or "", e[1]))
+        cp, ci = _split_period(c_ent, d_from, d_to)
+        sp, si = _split_period(s_ent, d_from, d_to)
+        c_bal = round(cp + sum(e[5] - e[6] for e in ci), 2)
+        s_bal = round(-(sp + sum(e[5] - e[6] for e in si)), 2)
+        if not (ci or si) and abs(cp) < 0.005 and abs(sp) < 0.005:
+            continue
+        if nonzero and abs(c_bal) < 0.005 and abs(s_bal) < 0.005:
+            continue
+        items.append(dict(g=g, c=c_codes, s=s_codes, name=parts[g[0]][0], reason=reason, c_ent=c_ent, s_ent=s_ent,
+                          c_bal=c_bal, s_bal=s_bal, net=round(c_bal - s_bal, 2)))
+    items.sort(key=lambda it: (not it["reason"], it["g"][0]))
+    rows, styles = [], {}
+    if mode == "summary":
+        for it in items:
+            if it["reason"]:
+                styles[len(rows)] = "shared"
+            net = it["net"]
+            rows.append((" ، ".join(it["c"]) or "-", " ، ".join(it["s"]) or "-", it["name"], it["reason"] or "-",
+                         it["c_bal"], it["s_bal"], net,
+                         "عليه (مدين لنا)" if net > 0.005 else ("له (دائن)" if net < -0.005 else "متوازن")))
+        cols = [("كود العميل", "t"), ("كود المورد", "t"), ("الاسم", "t"), ("مشترك (السبب)", "t"),
+                ("رصيد العميل (عليه)", "m"), ("رصيد المورد (له)", "m"), ("صافي المقاصة", "m"), ("الوضع", "t")]
+        n_sh = sum(1 for it in items if it["reason"])
+        total = ("", "", "الإجمالي", f"{n_sh} مشترك", *[round(sum(r[i] for r in rows), 2) for i in (4, 5, 6)], "")
+        notes = [f"عدد الأطراف: {len(rows)} (منها {n_sh} مشترك بين العملاء والموردين، مظللة في الأعلى)" + filt,
+                 "صافي المقاصة = رصيد العميل (عليه) − رصيد المورد (له): الموجب مستحق لنا والسالب مستحق له.",
+                 "الأطراف المشتركة تُكتشف بنفس الكود أو بالاسم الموحد أو بالرقم الضريبي."]
+        rep = Report("العملاء والموردون — المقاصة (إجماليات)", cols, rows, total, notes, period)
+    else:
+        tot_c = tot_s = 0.0
+        for it in items:
+            codes = " ، ".join(it["g"])
+            styles[len(rows)] = "shared" if it["reason"] else "group"
+            rows.append((codes, it["name"] + (f"   ⇄ مشترك ({it['reason']})" if it["reason"] else ""), "", "", "", "",
+                         None, None, None))
+            if it["c"]:
+                _pt_block(rows, styles, it["c_ent"], d_from, d_to, " ، ".join(it["c"]), it["name"],
+                          head="— حركاته كعميل", sub_label="إجمالي كعميل (عليه)")
+            if it["s"]:
+                _pt_block(rows, styles, it["s_ent"], d_from, d_to, " ، ".join(it["s"]), it["name"], sign=-1,
+                          head="— حركاته كمورد", sub_label="إجمالي كمورد (له)")
+            styles[len(rows)] = "net"
+            net = it["net"]
+            rows.append((codes, "صافي المقاصة", "", "", "عليه" if net > 0.005 else ("له" if net < -0.005 else "متوازن"),
+                         f"عليه {fmt(it['c_bal'])} − له {fmt(it['s_bal'])}", None, None, net))
+            tot_c += it["c_bal"]
+            tot_s += it["s_bal"]
+        cols = PT_DETAIL_COLS[:-1] + [("الرصيد / الصافي", "m")]
+        total = ("", f"الإجمالي العام ({len(items)} طرف)", "", "", "", f"عليه {fmt(tot_c)} − له {fmt(tot_s)}",
+                 None, None, round(tot_c - tot_s, 2))
+        notes = ["لكل طرف: حركاته كعميل (الرصيد الموجب عليه) ثم حركاته كمورد (الرصيد الموجب له) ثم صافي المقاصة." + filt,
+                 "الأطراف المشتركة (نفس الكود أو الاسم أو الرقم الضريبي) مظللة وتظهر أولاً."]
+        rep = Report("العملاء والموردون — المقاصة (تفاصيل)", cols, rows, total, notes, period)
+    rep.row_styles = styles
+    return rep
 
 
 def rep_aging(kind, p):
@@ -5797,13 +6646,17 @@ def rep_monthly_pnl(p):
         for k, typ, _, _, amt in journal_pl(conn, f"{k1}-01", month_end(k2).strftime("%Y-%m-%d"), by_month=True):
             (ex if typ == TYPE_EXP else oi)[k] += amt
         dsc = discount_totals(conn, f"{k1}-01", month_end(k2).strftime("%Y-%m-%d"), by_month=True)
+        hw = hw_cogs(conn, f"{k1}-01", month_end(k2).strftime("%Y-%m-%d"), by_month=True)
         for k, v in list(dsc.items()):
             oi[k] += v["earned"]
+        for k, v in list(hw.items()):
+            oi[k] -= v["credits"]
         assets = conn.execute("SELECT purchase_cost, salvage_value, useful_life_years, purchase_date FROM fixed_assets").fetchall()
     rows = []
     for k in keys:
         rsub, rcost = rt.get(k, (0, 0))
-        net, cogs = sales.get(k, 0) - rsub - (dsc[k]["sales_sub"] if k in dsc else 0), cg.get(k, 0) - rcost
+        net = sales.get(k, 0) - rsub - (dsc[k]["sales_sub"] if k in dsc else 0)
+        cogs = cg.get(k, 0) - rcost + (hw[k]["cogs"] if k in hw else 0)
         gross = net - cogs
         dep = _depreciation_in_month(assets, k)
         expenses, other = ex.get(k, 0), oi.get(k, 0)
@@ -5816,6 +6669,9 @@ def rep_monthly_pnl(p):
     notes = ["تُحسب الأشهر كاملة. المصروفات = سندات الصرف المصنفة «مصروفات عمومية» + القيود اليومية على حسابات المصروفات. "
              "صافي المبيعات بعد المرتجعات والإشعارات الدائنة. الإيرادات الأخرى من القيود اليومية + الخصم المكتسب من الموردين. "
              "الربح = مجمل الربح + الإيرادات الأخرى - المصروفات - الإهلاك."]
+    if hw:
+        notes.append("فترة HansaWorld المستوردة: تكلفة المبيعات بالجرد الدوري = المشتريات − إشعارات خصم الموردين، ويُطرح "
+                     "المخزون الختامي في شهر الترحيل (لا توجد أرصدة مخزون شهرية في الملفات، فتوزيع التكلفة على الأشهر تقريبي).")
     loss = [r[0] for r in rows if r[8] < 0]
     if loss:
         notes.append("أشهر بخسارة: " + "، ".join(loss))
@@ -6359,7 +7215,9 @@ def rep_kpi(p):
         j_exp, other_inc = journal_pl_totals(conn, a, b)
         exp += j_exp
         dsc = discount_totals(conn, a, b)[""]
-        other_inc += dsc["earned"]
+        hw = hw_cogs(conn, a, b)[""]
+        other_inc += dsc["earned"] - hw["credits"]
+        cogs += hw["cogs"]
         assets = conn.execute("SELECT purchase_cost, salvage_value, useful_life_years, purchase_date FROM fixed_assets").fetchall()
         (stock,) = one("SELECT SUM(quantity*cost_price) FROM inventory")
         cash = sum(cash_balances(conn, b).values())
@@ -6507,12 +7365,20 @@ REPORT_CATALOG = [
     ]),
     ("🎯 الملخص التنفيذي", [
         ("kpi", "مؤشرات القرار", rep_kpi, "ملخص الأداء والسيولة والذمم والمخزون والأوامر في صفحة واحدة. يستخدم الفترة."),
+        ("dash_src", "مصادر أرقام لوحة المؤشرات", lambda p: rep_dash_sources(p),
+         "كل رقم في لوحة المؤشرات: قيمته ومصدره ومعادلته (تراكمي من بداية العمل حتى اليوم)."),
     ]),
     ("💳 الذمم والمديونيات", [
         ("rec", "الذمم المدينة / أرصدة العملاء", rep_receivables, "كل عميل مدين لك بحسب الرصيد حتى تاريخ (إلى). يخصم المقبوضات والمرتجعات."),
         ("pay", "الذمم الدائنة / أرصدة الموردين", rep_payables, "كل مورد تدين له بحسب الرصيد حتى تاريخ (إلى)."),
         ("age_c", "أعمار ديون العملاء", lambda p: rep_aging("customer", p), "تحليل الديون بحسب عمر الفاتورة (0-30 / 31-60 / 61-90 / +90)."),
         ("age_s", "أعمار ديون الموردين", lambda p: rep_aging("supplier", p), "الفواتير المستحقة للموردين بحسب عمرها."),
+        ("pt_cust", "تقرير العملاء (إجماليات / تفاصيل مجمّعة)", rep_customers_report,
+         "إجماليات: سطر لكل عميل. تفاصيل مجمّعة: كل عميل بكل حركاته ثم إجمالي فرعي، ثم إجمالي عام. يستخدم الفترة و«العرض»."),
+        ("pt_supp", "تقرير الموردين (إجماليات / تفاصيل مجمّعة)", rep_suppliers_report,
+         "إجماليات: سطر لكل مورد. تفاصيل مجمّعة: كل مورد بكل حركاته ثم إجمالي فرعي، ثم إجمالي عام. يستخدم الفترة و«العرض»."),
+        ("pt_net", "العملاء والموردون معاً (المقاصة)", rep_partner_netting,
+         "رصيد الطرف كعميل مقابل رصيده كمورد وصافي المقاصة، مع إبراز الأطراف المشتركة (نفس الكود أو الاسم أو الرقم الضريبي)."),
     ]),
     ("📈 المبيعات والإيرادات", [
         ("s_period", "المبيعات حسب الفترة", rep_sales_period, "شهري أو يومي، مع المرتجعات والتكلفة والهامش والنمو. يستخدم التجميع."),
@@ -6587,7 +7453,18 @@ SUB_LABELS = {k: label for subs in SUB_PERMISSIONS.values() for k, label in subs
 ALL_PERMISSION_KEYS = PERMISSION_KEYS + list(SUB_PARENT)
 # تقارير تكشف أرصدة الشركاء: تحتاج صلاحية البيانات المالية للطرف المعني
 REPORT_FIN_REQUIRES = {"rec": "sales.customer_fin", "age_c": "sales.customer_fin",
-                       "pay": "purchase.supplier_fin", "age_s": "purchase.supplier_fin"}
+                       "pay": "purchase.supplier_fin", "age_s": "purchase.supplier_fin",
+                       "pt_cust": "sales.customer_fin", "pt_supp": "purchase.supplier_fin",
+                       "pt_net": ("sales.customer_fin", "purchase.supplier_fin")}   # tuple = يلزم الكل
+# تقارير تقبل خيار «العرض» (إجماليات / تفاصيل مجمّعة) وفلتري «غير الصفرية» و«المشتركة»
+PARTY_REPORTS = ("pt_cust", "pt_supp", "pt_net")
+
+
+def report_fin_needs(key):
+    """صلاحيات البيانات المالية المطلوبة للتقرير كأدوار: [] أو ["customer"] أو ["customer", "supplier"]."""
+    need = REPORT_FIN_REQUIRES.get(key)
+    needs = need if isinstance(need, tuple) else ((need,) if need else ())
+    return ["customer" if n.startswith("sales") else "supplier" for n in needs]
 
 
 def register_report_group(group_key, title, items):
@@ -6688,8 +7565,11 @@ def export_report_xlsx(path, rep):
             elif c in hl:
                 cell.fill = PatternFill("solid", fgColor="FEF08A")
 
-    for row in rep.rows:
-        put(row)
+    fills = {"group": "E0E7FF", "sub": "F1F5F9", "shared": "FCE7F3", "net": "DCFCE7"}
+    styles = getattr(rep, "row_styles", {}) or {}
+    for i, row in enumerate(rep.rows):
+        stl = styles.get(i)
+        put(row, bold=bool(stl), fill=fills.get(stl))
     if rep.total:
         put(rep.total, bold=True, fill="FDE68A")
     ws.append([])
@@ -6735,6 +7615,10 @@ def build_report_pdf(path, rep):
         col = i if ltr else ncols - 1 - i
         style += [("BACKGROUND", (col, 0), (col, 0), colors.HexColor("#ca8a04")),
                   ("BACKGROUND", (col, 1), (col, last), colors.HexColor("#fef08a"))]
+    fills = {"group": "#e0e7ff", "sub": "#f1f5f9", "shared": "#fce7f3", "net": "#dcfce7"}
+    for i, stl in (getattr(rep, "row_styles", {}) or {}).items():
+        if stl in fills and i < len(rep.rows):
+            style.append(("BACKGROUND", (0, i + 1), (-1, i + 1), colors.HexColor(fills[stl])))
     if rep.total:
         style.append(("BACKGROUND", (0, last + 1), (-1, last + 1), colors.HexColor("#fde68a")))
     t.setStyle(TableStyle(style))
@@ -6765,41 +7649,33 @@ def search_norm(text):
 # ============================================================
 # أدوات مشتركة بين الواجهتين (لوحة المؤشرات والشعار) — بدون Tkinter
 # ============================================================
+DASH_FROM = "1900-01-01"   # بداية «من أول العمل» للوحة المؤشرات
+
+
 def fetch_dashboard_metrics():
-    """مؤشرات اللوحة الرئيسية. كلها من الفواتير والسندات الفعلية (بدون ضريبة) لتتسق مع قائمة الدخل."""
+    """مؤشرات اللوحة الرئيسية: تراكمي من بداية العمل حتى اليوم، بدون ضريبة. أرقام الأرباح والمصروفات من income_figures
+    (نفس معادلات قائمة الدخل حرفياً) فتتطابق اللوحة مع قائمة الدخل لنفس الفترة:
+    مجمل الربح = صافي المبيعات − تكلفة المبيعات؛ صافي الربح = مجمل الربح + إيرادات أخرى − المصروفات التشغيلية − الإهلاك."""
     to = today()
-    to_dt = date.today()
+    f = income_figures(DASH_FROM, to)
     with db() as conn:
-        def one(sql, params=()):
-            return tuple((v or 0.0) for v in conn.execute(sql, params).fetchone())
-        (s_sub,) = one("SELECT SUM(subtotal) FROM sales_invoices")
-        r_sub, r_cost = one("SELECT SUM(subtotal), SUM(quantity*unit_cost) FROM returns_invoices WHERE return_type=?", (SALES_RETURN,))
-        (cogs,) = one("SELECT SUM(quantity*unit_cost) FROM sales_invoice_lines")
-        (p_sub,) = one("SELECT SUM(subtotal) FROM purchase_invoices")
-        (rp_sub,) = one("SELECT SUM(subtotal) FROM returns_invoices WHERE return_type=?", (PURCHASE_RETURN,))
-        (exp,) = one("SELECT SUM(amount) FROM cash_transactions WHERE trans_type='صرف' AND category=?", (CAT_EXPENSE,))
-        (stock,) = one("SELECT SUM(quantity*cost_price) FROM inventory")
-        assets = conn.execute("SELECT purchase_cost, salvage_value, useful_life_years, purchase_date FROM fixed_assets").fetchall()
-        j_exp, other_inc = journal_pl_totals(conn, "0000-01-01", "9999-12-31")
-        dsc = discount_totals(conn, "0000-01-01", "9999-12-31")[""]
-        other_inc += dsc["earned"]
         balances = cash_balances(conn)
         codes = cash_accounts(conn)
         bc = conn.execute("SELECT customer_name, SUM(subtotal) FROM sales_invoices GROUP BY customer_code ORDER BY SUM(subtotal) DESC LIMIT 1").fetchone()
         bs = conn.execute("SELECT supplier_name, SUM(subtotal) FROM purchase_invoices GROUP BY supplier_code ORDER BY SUM(subtotal) DESC LIMIT 1").fetchone()
         bi = conn.execute("SELECT item_name, SUM(quantity) FROM sales_invoice_lines GROUP BY item_code ORDER BY SUM(quantity) DESC LIMIT 1").fetchone()
-    dep = sum(accumulated_depreciation(c, s, l, d, to_dt) for c, s, l, d in assets)
-    net_sales = s_sub - r_sub - dsc["sales_sub"]
-    exp += j_exp
-    profit = net_sales - (cogs - r_cost) + other_inc - exp - dep
+    net_sales, stock = f["net_sales"], f["stock_value"]
     bals = partner_balances(to)
     cash_box = sum(v for k, v in balances.items() if is_cash_box(k, codes.get(k)))
     banks = sum(v for k, v in balances.items() if not is_cash_box(k, codes.get(k)))
     recv = sum(r["balance"] for r in bals if r["balance"] > 0.005)
     payb = -sum(r["balance"] for r in bals if r["balance"] < -0.005)
     return {
-        "sales": net_sales, "purchases": p_sub - rp_sub - dsc["pur_sub"], "gross": net_sales - (cogs - r_cost),
-        "expenses": exp, "depreciation": dep, "profit": profit,  # المصروفات التشغيلية ومصروف الإهلاك منفصلان
+        "sales": net_sales, "purchases": f["net_purchases"], "cogs": f["cogs"], "gross": f["gross"],
+        "other_income": f["total_other"], "expenses": f["opex"], "depreciation": f["dep"], "profit": f["net_profit"],
+        "opex_selling": f["opex_groups"]["selling"], "opex_admin": f["opex_groups"]["admin"],
+        "opex_other": f["opex_groups"]["other"], "hw_ref_adj": f["hw"]["ref_adj"], "warnings": dashboard_warnings(),
+        # المصروفات التشغيلية ومصروف الإهلاك منفصلان
         "cash_box": cash_box, "banks": banks, "cash_total": cash_box + banks,
         "net_position": cash_box + banks + recv - payb,
         "recv": recv, "payb": payb, "stock": stock,
@@ -6809,6 +7685,70 @@ def fetch_dashboard_metrics():
         "best_item": (bi[0], bi[1] or 0.0) if bi else None,
     }
 
+
+
+def dashboard_warnings():
+    """تنبيهات تؤثر على صحة أرقام الأرباح في اللوحة (تظهر تحت معادلة الأرباح)."""
+    out = []
+    with db() as conn:
+        refs = _safe_rows(conn, "SELECT COUNT(*) FROM hw_tb_reference WHERE substr(account_code,1,2)='43' "
+                                "OR substr(account_code,1,1)='5' OR account_code='41125'")
+        posted = _safe_rows(conn, "SELECT COUNT(*) FROM journal_entries WHERE source_type='hw_tb_expenses'")
+        docs = _safe_rows(conn, "SELECT COUNT(*) FROM hw_import_map WHERE role IN ('customer','supplier')")
+        segs = hw_ref_segments(conn) if docs and docs[0][0] else []
+        adj = hw_cogs_ref_adjustments(conn) if segs else []
+    if refs and refs[0][0] and not (posted and posted[0][0]):
+        out.append("مصروفات ميزان HansaWorld المرجعية (43xxx/5xxxx/41125) غير مُرحّلة بعد: المصروفات وصافي الربح ناقصة. "
+                   "رحّلها من مركز الاستيراد ← استيراد HansaWorld.")
+    if segs and not adj and any(c.startswith(HW_COGS_PREFIXES) for sg in segs for c in sg["amounts"]):
+        out.append("تاريخ آخر مستند HansaWorld بعد تاريخ الميزان المرجعي: تكلفة المبيعات بالجرد الدوري دون تسوية لدفتر "
+                   "HansaWorld. استورد ميزاناً محدّثاً.")
+    return out
+
+
+def dashboard_sources():
+    """مصدر كل رقم في لوحة المؤشرات ومعادلته (تقرير «مصادر أرقام لوحة المؤشرات»)."""
+    m = fetch_dashboard_metrics()
+    f = income_figures(DASH_FROM, today())
+    hw, dsc = f["hw"], f["dsc"]
+    hw_txt = ""
+    if abs(hw["purchases"]) + abs(hw["closing"]) + abs(hw["ref_adj"]) > 0.005:
+        hw_txt = (f"فترة HansaWorld (جرد دوري): مشتريات {fmt(hw['purchases'])} − إشعارات موردين {fmt(hw['credits'])} − "
+                  f"مخزون ختامي {fmt(hw['closing'])}" +
+                  (f" ± تسوية لدفتر HansaWorld (41110+41201) {fmt(hw['ref_adj'])}" if abs(hw["ref_adj"]) > 0.005 else "") +
+                  f" = {fmt(hw['cogs'])}")
+    og = f["opex_groups"]
+    rows = [
+        ("صافي المبيعات", m["sales"], f"فواتير البيع قبل الضريبة {fmt(f['sales_sub'])} − مرتجعات المبيعات {fmt(f['rs_sub'])} − "
+                                      f"إشعارات دائنة للعملاء {fmt(dsc['sales_sub'])} (sales_invoices / returns_invoices / post_discounts)"),
+        ("تكلفة المبيعات", m["cogs"], "؛ ".join(x for x in (
+            f"تكلفة بنود الفواتير الجديدة بالمتوسط المرجح {fmt(f['cogs_lines'])}" if abs(f["cogs_lines"]) > 0.005 else "",
+            hw_txt) if x) or "تكلفة بنود الفواتير بالمتوسط المرجح − تكلفة المرتجعات"),
+        ("مجمل الربح", m["gross"], "صافي المبيعات − تكلفة المبيعات"),
+        ("إيرادات أخرى", m["other_income"], "القيود اليومية على حسابات الإيرادات (ومنها 33xxx فروق العملة من ميزان HansaWorld) "
+                                           "+ الخصم المكتسب من الموردين + فروق أسعار مردودات المشتريات"),
+        ("المصروفات التشغيلية", m["expenses"],
+         f"سندات صرف المصروفات + القيود اليومية على حسابات المصروفات (ومنها قيد تجميع ميزان HansaWorld): "
+         f"بيعية وتسويقية (43) {fmt(og['selling'])} + إدارية وعمومية (5) {fmt(og['admin'])} + أخرى (41125 …) {fmt(og['other'])}"),
+        ("مصروف الإهلاك", m["depreciation"], "إهلاك الأصول الثابتة بالقسط الثابت من تاريخ الشراء حتى اليوم (fixed_assets)"),
+        ("صافي الربح", m["profit"], "مجمل الربح + إيرادات أخرى − المصروفات التشغيلية − الإهلاك"),
+        ("صافي المشتريات", m["purchases"], "فواتير الشراء قبل الضريبة − مرتجعات المشتريات − إشعارات خصم الموردين"),
+        ("قيمة المخزون", m["stock"], "Σ (الرصيد الحالي × متوسط التكلفة) لكل صنف (inventory)"),
+        ("الصناديق", m["cash_box"], "أرصدة حسابات النقدية: الرصيد الافتتاحي + المقبوضات − المدفوعات"),
+        ("البنوك", m["banks"], "أرصدة الحسابات البنكية: الرصيد الافتتاحي + المقبوضات − المدفوعات"),
+        ("الذمم المدينة", m["recv"], "مجموع الأرصدة المدينة للعملاء (كشف حساب كل طرف حتى اليوم)"),
+        ("الذمم الدائنة", m["payb"], "مجموع الأرصدة الدائنة للموردين (كشف حساب كل طرف حتى اليوم)"),
+        ("صافي المركز", m["net_position"], "النقدية والبنوك + الذمم المدينة − الذمم الدائنة"),
+    ]
+    notes = ["كل الأرقام تراكمية من بداية العمل حتى اليوم وقبل الضريبة، ومن نفس دالة قائمة الدخل (income_figures) "
+             "فتتطابق اللوحة مع قائمة الدخل لنفس الفترة."] + m["warnings"]
+    return rows, notes
+
+
+def rep_dash_sources(p):
+    rows, notes = dashboard_sources()
+    return Report("مصادر أرقام لوحة المؤشرات", [("البند", "t"), ("القيمة", "m"), ("المصدر والمعادلة", "t")], rows, None,
+                  notes, f"من بداية العمل حتى {today()}")
 
 
 AR_MONTHS = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"]

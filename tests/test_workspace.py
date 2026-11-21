@@ -14,7 +14,7 @@ D = "2026-03-10"
 
 def _at(F, page, **state):
     at = st_testing.AppTest.from_file(APP, default_timeout=120)
-    at.session_state["user"] = F.authenticate(F.DEFAULT_ADMIN_USER, "Elhagry2012@")
+    at.session_state["user"] = F.authenticate(F.main_admin_user(), os.environ["ELHAGRY_ADMIN_PASSWORD"])
     at.session_state["last_seen"] = time.time()
     at.session_state["nav"] = page
     for k, v in state.items():
